@@ -17,6 +17,12 @@ class InterviewerConfig:
     # natural human. Robotic (espeak-class) voices are excluded from production.
     tts_provider: str = "cartesia"     # cartesia | elevenlabs | kokoro | piper
     tts_voice_id: str | None = None    # provider voice preset; None = provider default
+    # Phase 2 LLM: any OpenAI-compatible chat endpoint (vLLM / Ollama / MLX).
+    llm_base_url: str = "http://127.0.0.1:8000/v1"
+    llm_model: str | None = None       # required for LLM turns
+    llm_token: str | None = None
+    session_store: str = "memory"      # memory | redis
+    redis_url: str = "redis://localhost:6379"
 
     @classmethod
     def from_env(cls, environ: dict[str, str] | None = None) -> "InterviewerConfig":
@@ -28,4 +34,9 @@ class InterviewerConfig:
             top_k=int(env.get("INTERVIEW_TOP_K", "5")),
             tts_provider=env.get("INTERVIEW_TTS_PROVIDER", "cartesia"),
             tts_voice_id=env.get("INTERVIEW_TTS_VOICE_ID"),
+            llm_base_url=env.get("INTERVIEW_LLM_BASE_URL", "http://127.0.0.1:8000/v1"),
+            llm_model=env.get("INTERVIEW_LLM_MODEL"),
+            llm_token=env.get("INTERVIEW_LLM_TOKEN"),
+            session_store=env.get("INTERVIEW_SESSION_STORE", "memory"),
+            redis_url=env.get("INTERVIEW_REDIS_URL", "redis://localhost:6379"),
         )

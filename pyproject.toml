@@ -31,6 +31,7 @@ dev = [
     "pytest>=8",
     "fastapi>=0.141,<1",
     "uvicorn[standard]>=0.52,<1",
+    "redis>=7.4,<8",        # session store (live-tested when Redis is reachable)
 ]
 
 [tool.setuptools.packages.find]

@@ -38,10 +38,43 @@ Candidate answer: {answer}
 Rubric context:
 {context}
 
-Score 1-5 on correctness, depth, and communication, each with one line of
-justification. End with "FOLLOW_UP:" plus one short question if any key
-concept is missing, otherwise "FOLLOW_UP: none"."""
+Respond with exactly this structure, no markdown, nothing else:
+Correctness: <1-5>
+Depth: <1-5>
+Communication: <1-5>
+Justification: one sentence on the strongest gap.
+FOLLOW_UP: one short question if any key concept is missing, otherwise: none"""
 
 
 def build_evaluation_prompt(question: str, answer: str, context: str) -> str:
     return EVALUATION_PROMPT.format(question=question, answer=answer, context=context)
+
+
+GREETING_PROMPT = (
+    "Greet the candidate for a {domain} technical mock interview. One short "
+    "spoken sentence, friendly and professional. No markdown, no lists."
+)
+
+
+def build_greeting_prompt(domain: str) -> str:
+    return GREETING_PROMPT.format(domain=domain)
+
+
+FOLLOWUP_PROMPT = (
+    "Ask exactly ONE short spoken follow-up question about: {followup}. "
+    "One sentence, no markdown."
+)
+
+
+def build_followup_prompt(followup: str) -> str:
+    return FOLLOWUP_PROMPT.format(followup=followup)
+
+
+WRAP_PROMPT = (
+    "The interview is over. Give one short spoken closing sentence and state "
+    "the average score out of 5 ({avg}). No markdown."
+)
+
+
+def build_wrap_prompt(avg: float) -> str:
+    return WRAP_PROMPT.format(avg=round(avg, 1))

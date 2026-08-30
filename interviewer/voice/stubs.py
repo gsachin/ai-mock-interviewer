@@ -25,14 +25,31 @@ class StubTTS:
 
 
 class StubLLM:
-    """Echo engine: yields canned responses from a script, then empty."""
+    """Canned engine: scripted streaming turns plus canned judge responses.
+    Exposes the same ``metrics`` interface as OpenAICompatibleLLM."""
 
-    def __init__(self, script: list[str] | None = None) -> None:
+    DEFAULT_EVALUATION = (
+        "Correctness: 4 - covers the core mechanism.\n"
+        "Depth: 3 - misses trade-offs.\n"
+        "Communication: 4 - clear and structured.\n"
+        "FOLLOW_UP: none"
+    )
+
+    def __init__(self, script: list[str] | None = None,
+                 evaluations: list[str] | None = None) -> None:
         self._script = list(script or [])
+        self._evaluations = list(evaluations or [self.DEFAULT_EVALUATION])
         self.prompts: list[list[dict]] = []
+        self.metrics = type("Metrics", (), {"first_token_ms": 1.0, "total_ms": 2.0})()
 
     async def respond_stream(self, messages: list[dict]) -> AsyncIterator[str]:
         self.prompts.append(messages)
-        for line in self._script:
+        line = self._script.pop(0) if self._script else ""
+        if line:
             yield line
-        self._script.clear()
+
+    async def respond(self, messages: list[dict]) -> str:
+        self.prompts.append(messages)
+        if self._evaluations:
+            return self._evaluations.pop(0)
+        return self.DEFAULT_EVALUATION

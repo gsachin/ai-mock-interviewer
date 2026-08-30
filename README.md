@@ -56,6 +56,11 @@ OIDC mode: set `RAG_MCP_TOKEN` to a bearer with scope `rag:retrieve`.
 | `INTERVIEW_TOP_K` | `5` | chunks per retrieval call |
 | `INTERVIEW_TTS_PROVIDER` | `cartesia` | `cartesia` \| `elevenlabs` \| `kokoro` \| `piper` |
 | `INTERVIEW_TTS_VOICE_ID` | — | voice preset; unset = provider default |
+| `INTERVIEW_LLM_BASE_URL` | `http://127.0.0.1:8000/v1` | OpenAI-compatible chat endpoint (vLLM / Ollama `/v1` / MLX `mlx_lm.server`) |
+| `INTERVIEW_LLM_MODEL` | — | required for LLM turns, e.g. `mlx-community/Qwen2.5-14B-Instruct-4bit` |
+| `INTERVIEW_LLM_TOKEN` | — | bearer for hosted endpoints |
+| `INTERVIEW_SESSION_STORE` | `memory` | `memory` \| `redis` (Redis-backed session summaries) |
+| `INTERVIEW_REDIS_URL` | `redis://localhost:6379` | Redis URL for the session store |
 
 ## Voice quality (hard requirement)
 
@@ -94,8 +99,30 @@ retrieval + domain follow-up → score ledger → wrap, reporting the rubric
 cache hit rate and per-turn timings (live gate: hit rate 1.0, 28–43 ms per
 question).
 
+## Phase 2: LLM interviewer (text mode)
+
+```bash
+INTERVIEW_LLM_BASE_URL=http://127.0.0.1:1234/v1 \
+INTERVIEW_LLM_MODEL=mlx-community/Qwen2.5-14B-Instruct-4bit \
+RAG_MCP_URL=http://127.0.0.1:8031/mcp \
+python -m interviewer.demo --questions 2            # full scripted interview
+python scripts/run_gate.py --sessions 10            # recorded gate sessions + aggregates
+```
+
+`LLMInterviewer` (interviewer/brain.py) drives the FSM with an
+OpenAI-compatible LLM (interviewer/llm.py — vLLM / Ollama / MLX, streamed,
+first-token + total metrics per hop): voice-optimized turns, an LLM-judge
+evaluation against the cache-gated rubric plus domain follow-up chunks
+(interviewer/scoring.py), one follow-up round when the judge asks, a score
+ledger, and session persistence (interviewer/session_store.py). See
+`docs/TRD_PHASE2_LLM_INTERVIEWER.md`.
+
+The deployed MLX server (`mlx_lm.server` on `:1234`,
+`mlx-community/Qwen2.5-14B-Instruct-4bit`) is reused as the live LLM — chat
+only, so embeddings stay on Ollama `nomic-embed-text`.
+
 ## Roadmap
 
-Phase 2: dialogue state + LLM turn engine (text mode). Phase 3: LiveKit
-voice pipeline (`pip install -e ".[voice]"`).
+Phase 3: LiveKit voice pipeline (`pip install -e ".[voice]"`) — plug the
+brain's turns into STT/TTS engines and meet the < 1.5 s budget.
 See `enterprise-rag-core`'s feasibility study + TRDs for the full plan.

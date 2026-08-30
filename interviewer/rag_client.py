@@ -33,6 +33,39 @@ class RetrieveContextResult(BaseModel):
     hit_source: str = "retrieval"
 
 
+class QuestionRef(BaseModel):
+    question_id: str
+    section_title: str
+    chunk_count: int
+
+
+class InterviewBankResult(BaseModel):
+    doc_id: str
+    tenant_id: str
+    questions: list[QuestionRef]
+    count: int
+
+
+class InterviewQuestionChunk(BaseModel):
+    chunk_id: str
+    content: str
+
+
+class InterviewQuestionResult(BaseModel):
+    doc_id: str
+    tenant_id: str
+    question_id: str
+    section_title: str
+    chunks: list[InterviewQuestionChunk]
+
+    @property
+    def formatted(self) -> str:
+        """The question as spoken/displayed text (title + chunk bodies)."""
+        return self.section_title + "\n\n" + "\n\n".join(
+            c.content for c in self.chunks
+        )
+
+
 class RagClient:
     """Async client for enterprise-rag-core's MCP endpoint."""
 
@@ -69,7 +102,9 @@ class RagClient:
     async def agent_context(self, resume_text: str, job_description: str,
                             rubric_query: str, channel: str = "voice") -> dict[str, Any]:
         """Full atomic agent-context envelope (direct injections + cached
-        rubric retrieval + rerank + U-shape formatting) from the RAG service."""
+        rubric retrieval + rerank + U-shape formatting) from the RAG service.
+        ``hit_source`` reports cache vs retrieval — the interviewer measures
+        its rubric cache hit rate from it."""
         text = await self._call("execute_agent_context", {
             "resume_text": resume_text,
             "job_description": job_description,
@@ -77,3 +112,26 @@ class RagClient:
             "channel": channel,
         })
         return json.loads(text)
+
+    async def interview_bank(self, doc_id: str) -> InterviewBankResult:
+        """Question catalog of a prepopulated bank (deterministic ids,
+        no search — an exact listing)."""
+        text = await self._call("interview_bank", {"doc_id": doc_id})
+        return InterviewBankResult.model_validate(json.loads(text))
+
+    async def interview_question(self, doc_id: str,
+                                 question_id: str) -> InterviewQuestionResult:
+        """One full question by deterministic id (exact fetch, no search)."""
+        text = await self._call("interview_question", {
+            "doc_id": doc_id, "question_id": question_id,
+        })
+        return InterviewQuestionResult.model_validate(json.loads(text))
+
+    async def interview_followup(self, query: str, domain: str = "",
+                                 top_k: int = 3) -> RetrieveContextResult:
+        """Domain-scoped hybrid retrieval for follow-ups and rubric checks
+        (department filter on the RAG service side)."""
+        text = await self._call("interview_followup", {
+            "query": query, "domain": domain, "top_k": top_k,
+        })
+        return RetrieveContextResult.model_validate(json.loads(text))

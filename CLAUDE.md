@@ -17,7 +17,8 @@ python -m uvicorn interviewer.server:app --port 8010   # management plane
 
 ## Architecture
 
-- `interviewer/rag_client.py` — MCP client for the RAG service (`streamable_http_client` + `ClientSession`, same pattern as enterprise-rag-core's `test_mcp_boot.py`). Tools: `retrieve_context(query, top_k)`, `execute_agent_context(...)`. OIDC bearer via `RAG_MCP_TOKEN`; unset = none-auth mode.
+- `interviewer/rag_client.py` — MCP client for the RAG service (`streamable_http_client` + `ClientSession`, same pattern as enterprise-rag-core's `test_mcp_boot.py`). Tools: `retrieve_context`, `execute_agent_context`, and the Phase 1 interview tools `interview_bank` / `interview_question` / `interview_followup` (domain-scoped). OIDC bearer via `RAG_MCP_TOKEN`; unset = none-auth mode.
+- `interviewer/interview.py` — `ScriptedInterview` drives the FSM over MCP: bank → question → answer → cache-gated rubric (`execute_agent_context` hit_source) + domain follow-up → score ledger → wrap. Gate metric: rubric cache hit rate (`InterviewStats`). Question banks live in `question_banks/*.md`, ingested idempotently by `scripts/prepopulate_banks.sh` (department = domain).
 - `interviewer/state_machine.py` — the interviewer dialogue FSM: `greeting → ask_question → listen → evaluate → (follow_up | score) → next → wrap`. Transitions are a pure dict; invalid (state, event) raises `InvalidTransition`. The FSM is the product — keep it fully unit-tested and free of I/O.
 - `interviewer/voice/` — STT/TTS/LLM engine protocols (`protocols.py`), text-mode stubs (`stubs.py`) for development without audio, and the LiveKit worker skeleton (`agent.py`, guarded import — livekit-agents is an optional extra).
 - `interviewer/server.py` — FastAPI management plane (health, session CRUD, scores). Request/response only; audio never flows through it.

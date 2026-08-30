@@ -73,15 +73,29 @@ The voice identity is per-deployment config, not per-user audio; see
 |---|---|
 | MCP client for the RAG service | `interviewer/rag_client.py` |
 | Interviewer state machine (Phase 2) | `interviewer/state_machine.py` |
+| Scripted text-mode interview loop (Phase 1 gate) | `interviewer/interview.py` |
+| Domain question banks (16 questions, real content) | `question_banks/` + `scripts/prepopulate_banks.sh` |
 | Voice-optimized prompt templates | `interviewer/prompts.py` |
 | STT/TTS/LLM engine protocols + text-mode stubs | `interviewer/voice/` |
 | LiveKit agent worker skeleton (Phase 3) | `interviewer/voice/agent.py` |
 | Management-plane FastAPI app | `interviewer/server.py` |
-| Tests | `tests/` |
+| Tests (unit + `live` integration) | `tests/` |
+
+## Phase 1: scripted interview over MCP
+
+```bash
+scripts/prepopulate_banks.sh               # ingest the 4 domain banks (idempotent)
+RAG_MCP_URL=http://127.0.0.1:8031/mcp python -m pytest tests/ -m live
+```
+
+`ScriptedInterview` walks the full FSM over the RAG service: question bank
+catalog → exact question fetch → candidate answer → cache-gated rubric
+retrieval + domain follow-up → score ledger → wrap, reporting the rubric
+cache hit rate and per-turn timings (live gate: hit rate 1.0, 28–43 ms per
+question).
 
 ## Roadmap
 
-Phase 1: question-bank MCP tools on the RAG side + retrieval-backed
-interviewer here. Phase 2: dialogue state + LLM turn engine (text mode).
-Phase 3: LiveKit voice pipeline (`pip install -e ".[voice]"`).
-See `enterprise-rag-core`'s feasibility study + TRD for the full plan.
+Phase 2: dialogue state + LLM turn engine (text mode). Phase 3: LiveKit
+voice pipeline (`pip install -e ".[voice]"`).
+See `enterprise-rag-core`'s feasibility study + TRDs for the full plan.

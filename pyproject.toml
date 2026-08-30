@@ -1,0 +1,43 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mock-interviewer"
+version = "0.1.0"
+description = "Real-time web-based AI technical mock interviewer (voice chat) — MCP consumer of the standalone enterprise-rag-core service."
+readme = "README.md"
+requires-python = ">=3.11,<3.14"
+license = { text = "Proprietary" }
+authors = [{ name = "AI Work" }]
+
+# Core deps stay minimal: the MCP SDK client + httpx. The RAG service itself
+# is a separate deployment — this package never imports enterprise-rag-core.
+dependencies = [
+    "httpx>=0.28,<1",
+    "pydantic>=2.12,<3",
+    "mcp>=2.1.1,<3",          # matches the core service's pinned SDK (2.1.1)
+]
+
+[project.optional-dependencies]
+api = [
+    "fastapi>=0.141,<1",
+    "uvicorn[standard]>=0.52,<1",
+]
+voice = [
+    "livekit-agents>=1",      # Phase 3: LiveKit agent worker (STT/TTS plugins, VAD, turn detection)
+]
+dev = [
+    "pytest>=8",
+    "fastapi>=0.141,<1",
+    "uvicorn[standard]>=0.52,<1",
+]
+
+[tool.setuptools.packages.find]
+include = ["interviewer*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "live: integration against a running enterprise-rag-core MCP server (set RAG_MCP_URL)",
+]

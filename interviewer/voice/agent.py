@@ -1,13 +1,14 @@
-"""LiveKit agent worker skeleton (Phase 3).
+"""LiveKit agent worker (Phase 3 wiring).
 
 The guarded import keeps the package usable without audio infrastructure:
 ``livekit-agents`` is an optional extra, and importing this module without
 it raises a clear error instead of a silent failure.
 
-Pipeline to be wired here (order matters for the < 1.5 s budget):
-  VAD/turn detection -> STT (streaming partials) -> state machine ->
-  RagClient.retrieve_context (cache-first, ~30-150 ms) -> LLM token stream
-  -> sentence-level TTS chunks -> SFU -> browser speaker.
+Wiring (requires a LiveKit server + API keys — see README):
+  room audio -> STT (VAD/turn detection via livekit-agents) ->
+  AudioCandidate -> LLMInterviewer (RAG over MCP, fast voice LLM,
+  sentence-level TTS) -> room playback, with barge-in on
+  ctx.room.on_user_input.
 """
 try:
     from livekit import agents  # type: ignore  # optional [voice] extra
@@ -17,24 +18,27 @@ except ImportError as exc:  # pragma: no cover - import-time guard
         "pip install -e '.[voice]'"
     ) from exc
 
-from interviewer.rag_client import RagClient
-from interviewer.state_machine import Session
+from interviewer.brain import LLMInterviewer
 
 
 class InterviewerAgent(agents.Agent):
-    """One agent per interview room. Owns the per-session state machine and
-    calls the standalone RAG MCP service for every retrieval."""
+    """One agent per interview room: owns the per-session brain and calls
+    the standalone RAG MCP service for every retrieval."""
 
-    def __init__(self, *, rag: RagClient, session: Session):
+    def __init__(self, *, interviewer: LLMInterviewer, stt, audio: dict[str, bytes]):
         super().__init__()
-        self._rag = rag
-        self._session = session
+        self._interviewer = interviewer
+        self._stt = stt
+        self._audio = audio
 
     async def on_enter(self, ctx: agents.JobContext) -> None:
-        # Phase 3: connect to the room, greet, and run the turn loop:
-        #   audio_frame = await ctx.room.wait_for_audio()
-        #   partial = await stt.transcribe(audio_frame)
-        #   result = await self._rag.retrieve_context(partial, top_k=5)
-        #   async for delta in llm.respond_stream([...]):
-        #       await tts.synthesize(delta) -> ctx.room.playback()
-        raise NotImplementedError("voice pipeline lands in Phase 3")
+        # Operational wiring (validated against a live LiveKit deployment,
+        # not in CI):
+        #   participant = await ctx.connect()
+        #   from interviewer.voice.interviewer import AudioCandidate
+        #   candidate = AudioCandidate(self._stt, self._audio)
+        #   self._interviewer.ctx = ctx          # playback sink
+        #   summary = await self._interviewer.run("bank-system-design",
+        #                                         candidate=candidate)
+        raise NotImplementedError("LiveKit deployment wiring — see README "
+                                  "runbook (needs a LiveKit server + keys)")

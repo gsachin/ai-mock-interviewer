@@ -23,6 +23,18 @@ class InterviewerConfig:
     llm_token: str | None = None
     session_store: str = "memory"      # memory | redis
     redis_url: str = "redis://localhost:6379"
+    # Phase 3 voice: STT/TTS providers + the hot-path LLM (a fast small model —
+    # the judge LLM above can stay slow since judging is off the hot path).
+    stt_provider: str = "stub"         # deepgram | faster-whisper | stub
+    deepgram_api_key: str | None = None
+    whisper_model: str = "base"
+    whisper_device: str = "auto"
+    cartesia_api_key: str | None = None
+    elevenlabs_api_key: str | None = None
+    piper_binary: str = "piper"
+    piper_model: str | None = None
+    voice_llm_base_url: str | None = None
+    voice_llm_model: str | None = None
 
     @classmethod
     def from_env(cls, environ: dict[str, str] | None = None) -> "InterviewerConfig":
@@ -39,4 +51,14 @@ class InterviewerConfig:
             llm_token=env.get("INTERVIEW_LLM_TOKEN"),
             session_store=env.get("INTERVIEW_SESSION_STORE", "memory"),
             redis_url=env.get("INTERVIEW_REDIS_URL", "redis://localhost:6379"),
+            stt_provider=env.get("INTERVIEW_STT_PROVIDER", "stub"),
+            deepgram_api_key=env.get("INTERVIEW_DEEPGRAM_API_KEY"),
+            whisper_model=env.get("INTERVIEW_WHISPER_MODEL", "base"),
+            whisper_device=env.get("INTERVIEW_WHISPER_DEVICE", "auto"),
+            cartesia_api_key=env.get("INTERVIEW_CARTESIA_API_KEY"),
+            elevenlabs_api_key=env.get("INTERVIEW_ELEVENLABS_API_KEY"),
+            piper_binary=env.get("INTERVIEW_PIPER_BINARY", "piper"),
+            piper_model=env.get("INTERVIEW_PIPER_MODEL"),
+            voice_llm_base_url=env.get("INTERVIEW_VOICE_LLM_BASE_URL"),
+            voice_llm_model=env.get("INTERVIEW_VOICE_LLM_MODEL"),
         )

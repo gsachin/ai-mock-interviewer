@@ -1,0 +1,61 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Mock Interviewer — Voice Room</title>
+  <style>
+    body { font-family: system-ui, sans-serif; max-width: 640px; margin: 40px auto; padding: 0 16px; }
+    button { font-size: 16px; padding: 10px 18px; }
+    #status { color: #666; margin: 12px 0; }
+    #log { white-space: pre-wrap; background: #f4f4f4; border-radius: 8px; padding: 12px; min-height: 120px; }
+  </style>
+</head>
+<body>
+  <h1>Mock Interviewer — Voice Room</h1>
+  <p>Joins a LiveKit room and streams mic audio to the interviewer agent
+  (Phase 3). Requires a LiveKit server URL and a token endpoint — see the
+  README runbook; this page is a thin client, all interviewer logic runs
+  server-side in the agent worker.</p>
+  <button id="join">Join room</button>
+  <div id="status">Not connected.</div>
+  <div id="log"></div>
+
+  <script src="https://cdn.jsdelivr.net/npm/livekit-client@2/dist/livekit-client.umd.min.js"></script>
+  <script>
+    const joinBtn = document.getElementById("join");
+    const statusEl = document.getElementById("status");
+    const logEl = document.getElementById("log");
+
+    joinBtn.addEventListener("click", async () => {
+      const url = localStorage.getItem("livekit_url") || prompt("LiveKit server URL (wss://...)");
+      const token = localStorage.getItem("livekit_token") || prompt("Access token (JWT)");
+      if (!url || !token) return;
+      localStorage.setItem("livekit_url", url);
+      localStorage.setItem("livekit_token", token);
+
+      const room = new LivekitClient.Room();
+      room.on(LivekitClient.RoomEvent.TrackSubscribed, (track) => {
+        if (track.kind === "audio") {
+          const el = track.attach();
+          el.autoplay = true;
+          document.body.appendChild(el);
+          logEl.textContent += "audio track attached\n";
+        }
+      });
+      room.on(LivekitClient.RoomEvent.Disconnected, () => {
+        statusEl.textContent = "Disconnected.";
+      });
+
+      await room.connect(url, token);
+      statusEl.textContent = "Connected — requesting mic...";
+      try {
+        await room.localParticipant.setMicrophoneEnabled(true);
+        logEl.textContent += "mic live — the interviewer agent should greet you\n";
+      } catch (e) {
+        statusEl.textContent = "Mic error: " + e.message;
+      }
+    });
+  </script>
+</body>
+</html>

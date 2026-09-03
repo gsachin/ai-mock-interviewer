@@ -47,7 +47,8 @@ class QueueCandidate:
         self._responses = responses
 
     async def answer(self, question_id: str,
-                     timeout_s: float | None = None) -> CandidateAnswer:
+                     timeout_s: float | None = None,
+                     drop_before_ts: float | None = None) -> CandidateAnswer:
         self._requests.put(question_id)
         text = await asyncio.to_thread(self._responses.get)
         return CandidateAnswer(text=text)

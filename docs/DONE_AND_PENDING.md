@@ -1,7 +1,8 @@
 # DONE & PENDING — ai-mock-interviewer (voice phase)
 
-**Date:** 2026-09-03 · **Status:** RCA browser fixes (T1–T8) **implemented + verified**;
-manual browser-with-mic check still **pending** (owner: user, after app testing)
+**Date:** 2026-09-03 (evening) · **Status:** RCA fixes (T1–T8) **done**; **manual
+answer toggle + Retake/Next review gate implemented + verified**; manual
+browser-with-mic check still **pending** (owner: user, after app testing)
 **Read also:** `docs/STATUS.md` (launch + numbers) · `docs/RCA_VOICE_BROWSER_INTERVIEW.md`
 (fix plan — all T tasks now DONE per §8 status block)
 
@@ -30,11 +31,27 @@ Implemented per `docs/RCA_VOICE_BROWSER_INTERVIEW.md` §4; **64 unit tests green
 | T7 | `ended` event + end-state | worker publishes `ended {reason}` on job end; page renders end-state + auto-disconnect for a fresh Start; `INTERVIEW_JUDGE_MODEL` override config |
 | T8 | Regression tests | +14 tests (protocol ordering, timeout path w/ real `LiveKitCandidate`, EchoGate decisions, sink state, factory wiring, config envs) — 64 passed |
 
+### Manual answer toggle + Retake/Next review gate — NEW 2026-09-03 (evening)
+Answer capture is now **explicit, not voice-activity dependent**: the page's
+single toggle drives the flow, and each scored question ends at a **review
+gate** where the candidate chooses Retake or Next (product decisions from the
+user, 2026-09-03):
+
+| Piece | Behavior | Where |
+|---|---|---|
+| Start/Finish toggle | Idle = Start interview. Interviewer speaking/processing → **disabled**. Question done (`listening`) → **▶ Start answer** → click → **■ Finish answer** (elapsed timer) → audio since Start is transcribed. After the last question's wrap → **■ Finish session** → back to Start. A small "End call ✕" link remains as an escape | `web/index.html` |
+| Per-question feedback | The judge's single evaluation call also returns **Verdict: correct/partial/incorrect** + a short **Model answer**; both ride on the `score` event and the review gate shows a ✅/◐/❌ badge, the gap, and the correct answer (fallback verdict derived from scores when the judge omits it) | `interviewer/scoring.py`, `prompts.py`, `brain.py`, `web/index.html` |
+| Transcription no-hang (RCA 2026-09-03) | Multi-minute "Transcribing…" after a short answer: the manual arm captured thinking-time silence and whisper decoded it all (measured 35 s CPU for 150 s quiet; worse under TTS/judge contention). Fixes: energy-trim the armed buffer to the speech region before STT (`voice/trim.py`), clamp engine input to 60 s + harden the CUDA→CPU fallback (`stt.py`), pin `INTERVIEW_WHISPER_DEVICE=cpu` in the launcher (this box lacks cuBLAS/cuDNN; per-room CUDA probing wasted seconds and could stall), and a 20 s page watchdog so a slow decode never looks hung | `interviewer/voice/trim.py`, `stt.py`, `agent.py`, `start_services.ps1`, `web/index.html` |
+| 60 s no-answer | Timeout → interviewer re-prompts once, toggle returns to Start (2nd 60 s chance); second silence → scored & moves on | `brain._listen` (unchanged semantics) |
+| Retake / Next | After every scored question the brain pauses at a **review gate**: Retake re-asks the same question and **replaces** its score row; Next advances (90 s without a choice auto-advances). Text/headless runs pass no decider → old automated flow, unchanged | `brain.py` (decider protocol), `voice/livekit.py` (`LiveKitReviewer`) |
+| Manual capture | Worker buffers the candidate's mic only between `answer_start` / `answer_finish` control messages (data topic `control`); STT-first echo + notice events preserved. VAD auto-endpoint path removed; re-prompt answers are no longer drained as junk (F1 `drop_before_ts`) | `interviewer/voice/agent.py`, `voice/livekit.py` |
+
 ### Verified 2026-09-03
-- `.venv\Scripts\python.exe -m pytest tests/ -m "not live"` → **64 passed, 5 deselected**.
-- No-mic E2E (`scripts/e2e_voice_client.py --answers 6`) on the launcher stack →
-  **PASSED**: state=wrap, questions=3, 3 progressive scores, every answer echoed
-  (`heard me: …`), `ended` event received, interviewer audio frames > 0.
+- `.venv\Scripts\python.exe -m pytest tests/ -m "not live"` → **71 passed, 5 deselected**.
+- No-mic E2E (`scripts/e2e_voice_client.py --answers 5`, now driving the manual
+  protocol) on the launcher stack → **PASSED**: state=wrap, questions=3, 3
+  progressive scores, 6 `heard me` echoes, review-gate `next` advanced each
+  question, `ended` received, ~2:07 wall.
 - Page served (HTTP 200) and inline JS passes `node --check`.
 
 ---
@@ -42,11 +59,14 @@ Implemented per `docs/RCA_VOICE_BROWSER_INTERVIEW.md` §4; **64 unit tests green
 ## 2. ⏳ PENDING — for future work (prioritized)
 
 ### P-A. Manual browser verification (NEXT — owner: user, after app testing)
-The RCA §5 browser checklist cannot be automated here: speak an answer and confirm
-your words appear as text within ~1 s; a loader + label is visible during every
-backend phase (watch the 30–60 s judge window); the scoreboard grows after each
-question; End call works from every state; 3 questions per session.
-Stack state at last boot: running (see §3 to restart).
+Browser checklist (RCA §5 + the new toggle flow): the toggle is **disabled
+while the interviewer speaks** and becomes **▶ Start answer** when it is your
+turn; recording shows **■ Finish answer** with a count-up; your words appear
+as text ~1 s after Finish; the scoreboard row appears per question with
+**↻ Retake answer / Next question ▶**; Retake re-asks and replaces the score;
+Next moves on; after the summary the toggle reads **■ Finish session**; 60 s
+of silence triggers one re-prompt and the toggle re-enables; End call works
+from any state. Stack state at last boot: running (see §3 to restart).
 
 ### P-B. RCA §7 improvement suggestions (architect review — all still pending)
 | # | Suggestion | Status |

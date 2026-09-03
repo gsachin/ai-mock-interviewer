@@ -2,13 +2,14 @@
 
 Flow: POST /voice/token -> join the LiveKit room -> the agent worker is
 dispatched -> the interviewer greets/asks via TTS (audio track) -> this
-client plays prepared answers (Kokoro-synthesized) after each interviewer
-turn -> the worker transcribes (faster-whisper), judges, and finally
-publishes the interview summary as a data packet.
+client drives the manual answer protocol (control messages: ``answer_start``
+before playing each prepared Kokoro answer, ``answer_finish`` after, and
+``next`` at each review gate) -> the worker transcribes (faster-whisper),
+judges, and finally publishes the interview summary as a data packet.
 
 Assertions: interviewer audio arrives, every prepared answer is consumed or
 dropped without breaking the flow, the summary reaches state ``wrap`` with
-scores and a voice budget bar.
+scores, and the ``ended`` event is received.
 
 Usage (with the full stack up — see the README voice runbook):
     python scripts/e2e_voice_client.py [--domain system-design] [--answers N]
@@ -81,6 +82,16 @@ class CandidateClient:
         async for _ in stream:
             self._interviewer_frames += 1
 
+    async def _control(self, msg: dict) -> None:
+        """Manual-protocol control messages the worker acts on.
+        ``LocalParticipant.publish_data`` is a coroutine — awaiting matters
+        (an un-awaited call silently sends nothing)."""
+        try:
+            await self._room.local_participant.publish_data(
+                json.dumps(msg).encode(), reliable=True, topic="control")
+        except Exception as exc:  # pragma: no cover - best effort
+            print(f"[client] control send failed: {exc}")
+
     def _on_data(self, packet: rtc.DataPacket, *args):
         try:
             event = json.loads(packet.data)
@@ -93,7 +104,14 @@ class CandidateClient:
             print(f"[client] heard me: {event['text'][:60]!r}")
         elif event.get("type") == "score":
             print(f"[client] score: {event['score']['question_id']} "
-                  f"{event['score']['scores']}")
+                  f"{event['score']['scores']} "
+                  f"verdict={event['score'].get('verdict')} "
+                  f"model={event['score'].get('model_answer', '')[:60]!r}")
+            # review gate: the interview waits for our decision — advance
+            asyncio.create_task(self._control({"type": "next"}))
+            print("[client] review gate -> next")
+        elif event.get("type") == "notice":
+            print(f"[client] notice: {event.get('text', '')}")
         elif event.get("type") == "summary":
             self.summary = event["summary"]   # compact: {state, scores, stats}
             print("[client] SUMMARY received — interview complete")
@@ -108,15 +126,16 @@ class CandidateClient:
         (None until one arrives)."""
         for ev in self._events[seen:]:
             if ev.get("role") == "interviewer" and ev.get("stage") in (
-                    "question", "followup"):
+                    "question", "followup", "reprompt"):
                 return ev["stage"]
         return None
 
     async def _answer_loop(self):
-        """Answer every question/follow-up the interviewer asks, in order.
-        The brain emits staged turns — a stage of ``question``/``followup``
-        means it is listening. Synthesis happens lazily (the join must not
-        wait for it)."""
+        """Answer every question/follow-up the interviewer asks, in order,
+        using the manual protocol: ``answer_start`` -> play the prepared
+        answer -> ``answer_finish``. The brain emits staged turns — a stage
+        of ``question``/``followup``/``reprompt`` means it is listening.
+        Synthesis happens lazily (the join must not wait for it)."""
         await asyncio.sleep(1.0)  # let the greeting play out
         turns_seen = 0
         while not self._done.is_set():
@@ -134,7 +153,9 @@ class CandidateClient:
                                       % len(self._answer_texts)]
             self._used += 1
             audio = await self._tts.synthesize(text)
+            await self._control({"type": "answer_start"})
             await self._speak(audio)
+            await self._control({"type": "answer_finish"})
             print(f"[client] answered {stage} ({self._used}"
                   f"/{len(self._answer_texts)} prepared): {text[:50]}…")
 

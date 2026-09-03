@@ -5,11 +5,20 @@ lazy import so the extra is optional). ``resolve_stt`` picks by provider —
 unknown providers raise, mirroring the core's backend guards.
 """
 import asyncio
+import logging
+import time
 
 import httpx
 import numpy as np
 
 from interviewer.voice.protocols import STTEngine
+
+log = logging.getLogger(__name__)
+
+# Faster-whisper decodes the whole input; CPU int8 runs ~0.15-0.25x real
+# time on quiet buffers (measured 35 s for 150 s — RCA 2026-09-03). The
+# worker trims answers first; this is the engine-side backstop.
+MAX_AUDIO_BYTES = 60 * 16000 * 2      # 16 kHz mono s16le, 60 s
 
 _DEEPGRAM_LISTEN_URL = "https://api.deepgram.com/v1/listen"
 
@@ -60,10 +69,19 @@ class FasterWhisperSTT:
             kwargs["compute_type"] = "int8"  # ~2x faster finals on CPU
         return WhisperModel(self._model_size, **kwargs)
 
-    def _ensure_model(self):
+    def _ensure_model(self, device: str | None = None) -> None:
         if self._model is None:
-            self._model = self._build(self._device)
-        return self._model
+            self._model = self._build(device or self._device)
+
+    def _fallback_to_cpu(self, exc: Exception) -> None:
+        """CUDA runtime not loadable (e.g. cublas64_12.dll missing) —
+        rebuild once on CPU and remember the choice. Covers model BUILD
+        failures too, not only inference failures."""
+        if self._device == "cpu":
+            raise exc
+        log.warning("CUDA unavailable (%s) — falling back to CPU int8", exc)
+        self._device = "cpu"
+        self._model = None
 
     async def _transcribe_once(self, model, audio: np.ndarray) -> str:
         segments, _info = await asyncio.to_thread(
@@ -72,24 +90,31 @@ class FasterWhisperSTT:
         return " ".join(seg.text.strip() for seg in segments)
 
     async def transcribe(self, audio_frame: bytes) -> str:
-        """``audio_frame`` is 16 kHz mono s16le PCM (the VAD speech buffer).
+        """``audio_frame`` is 16 kHz mono s16le PCM (the speech buffer).
         Converted to float32 for faster-whisper; beam_size=1 keeps finals
-        fast on CPU."""
-        model = await asyncio.to_thread(self._ensure_model)
+        fast on CPU. Input is clamped to the most recent 60 s — whisper
+        decodes the entire buffer, so a long quiet tail would otherwise
+        cost minutes of CPU (RCA 2026-09-03)."""
+        # keep the tail: the candidate speaks right before clicking Finish
+        if len(audio_frame) > MAX_AUDIO_BYTES:
+            log.info("faster-whisper input clamped: %.1f s -> 60 s",
+                     len(audio_frame) / 32000.0)
+            audio_frame = audio_frame[-MAX_AUDIO_BYTES:]
+        t0 = time.perf_counter()
         audio = (np.frombuffer(audio_frame, dtype=np.int16)
                  .astype(np.float32) / 32768.0)
         try:
-            return await self._transcribe_once(model, audio)
-        except RuntimeError as exc:
-            if self._device != "auto":
-                raise
-            # CUDA runtime not loadable (e.g. cublas64_12.dll missing) —
-            # rebuild once on CPU and remember the choice.
-            print(f"[stt] CUDA unavailable ({exc}) — falling back to CPU int8")
-            self._device = "cpu"
-            self._model = None
-            model = await asyncio.to_thread(self._ensure_model)
-            return await self._transcribe_once(model, audio)
+            await asyncio.to_thread(self._ensure_model)
+            text = await self._transcribe_once(self._model, audio)
+        except (RuntimeError, OSError) as exc:
+            self._fallback_to_cpu(exc)
+            await asyncio.to_thread(self._ensure_model)
+            text = await self._transcribe_once(self._model, audio)
+        elapsed = time.perf_counter() - t0
+        if elapsed > 3.0:   # slow decodes are worth knowing about
+            log.info("faster-whisper decode took %.1f s for %.1f s of audio",
+                     elapsed, len(audio_frame) / 32000.0)
+        return text
 
 
 def resolve_stt(provider: str, config) -> STTEngine:

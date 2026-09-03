@@ -21,7 +21,8 @@ class AudioCandidate:
         self._audio = dict(audio or {})
 
     async def answer(self, question_id: str,
-                     timeout_s: float | None = None) -> CandidateAnswer:
+                     timeout_s: float | None = None,
+                     drop_before_ts: float | None = None) -> CandidateAnswer:
         audio = self._audio.pop(question_id, b"")
         if not audio:
             return CandidateAnswer(text="")
@@ -32,7 +33,8 @@ class AudioCandidate:
 
 def build_voice_interviewer(config: InterviewerConfig, rag: Any,
                             session: Any, sink: Any = None,
-                            on_event: Any = None) -> LLMInterviewer:
+                            on_event: Any = None,
+                            decider: Any = None) -> LLMInterviewer:
     """Voice-enabled brain: STT/TTS engines from config, a fast voice LLM
     for the hot path (falls back to the judge LLM), a fresh latency budget
     tracker, and an optional playback sink (the LiveKit room). The judge LLM
@@ -66,4 +68,5 @@ def build_voice_interviewer(config: InterviewerConfig, rag: Any,
         budget=LatencyBudgetTracker(),
         sink=sink,
         on_event=on_event,
+        decider=decider,
     )

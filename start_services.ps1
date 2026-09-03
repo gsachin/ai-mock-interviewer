@@ -331,6 +331,9 @@ if ($WithVoice) {
     # Self-hosted voice engines + the fast hot-path LLM (qwen2.5:14b is the
     # judge; llama3.2:3b carries the <1.5s round-trip).
     if ([string]::IsNullOrEmpty($env:INTERVIEW_STT_PROVIDER)) { $env:INTERVIEW_STT_PROVIDER = "faster-whisper" }
+    # This box lacks the CUDA cuBLAS/cuDNN DLLs; probe every room costs time
+    # and can stall first-answer transcription (RCA 2026-09-03) — pin CPU int8.
+    if ([string]::IsNullOrEmpty($env:INTERVIEW_WHISPER_DEVICE)) { $env:INTERVIEW_WHISPER_DEVICE = "cpu" }
     if ([string]::IsNullOrEmpty($env:INTERVIEW_TTS_PROVIDER)) { $env:INTERVIEW_TTS_PROVIDER = "kokoro" }
     $env:INTERVIEW_VOICE_LLM_BASE_URL = $LLMBaseUrl
     $env:INTERVIEW_VOICE_LLM_MODEL    = $VoiceLLMModel

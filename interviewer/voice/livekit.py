@@ -19,41 +19,84 @@ from interviewer.brain import CandidateAnswer
 
 
 class LiveKitCandidate:
-    """Candidate whose answers arrive from STT utterance-end events.
+    """Candidate whose answers arrive from the worker's manual answer
+    capture (Start answer -> mic buffer -> Finish answer -> STT).
 
-    ``push`` is called by the worker's VAD/STT loop; ``answer`` awaits the
-    next transcript (in a live 1:1 interview the only speech between the
-    question and the next turn is the candidate's answer, so ordering by
-    arrival is sufficient). ``answer`` is bounded by ``timeout_s`` — the
-    no-hang gate (RCA R1): it raises ``TimeoutError`` so the brain can
-    re-prompt and move on instead of waiting forever for a mic that never
-    delivers speech.
+    ``push`` is called by the worker after each manual answer is
+    transcribed; ``answer`` awaits the next transcript. ``answer`` is
+    bounded by ``timeout_s`` — the no-hang gate (RCA R1): it raises
+    ``TimeoutError`` so the brain can re-prompt and move on instead of
+    waiting forever for a mic that never delivers speech.
+    ``drop_before_ts`` (monotonic) keeps transcripts that arrived at or
+    after that instant — the brain uses it so an answer spoken while the
+    re-prompt plays is not drained as barge-in junk.
     """
 
     def __init__(self) -> None:
-        self._queue: asyncio.Queue[tuple[str, float]] = asyncio.Queue()
+        self._queue: asyncio.Queue[tuple[str, float, float]] = asyncio.Queue()
 
     def push(self, transcript: str, stt_ms: float) -> None:
         if transcript.strip():
-            self._queue.put_nowait((transcript.strip(), stt_ms))
+            self._queue.put_nowait(
+                (transcript.strip(), stt_ms, time.monotonic()))
 
     async def answer(self, question_id: str,
-                     timeout_s: float | None = None) -> CandidateAnswer:
+                     timeout_s: float | None = None,
+                     drop_before_ts: float | None = None) -> CandidateAnswer:
         # Drop stale interjections that arrived while the interviewer was
-        # still speaking (barge-in leftovers). The brain calls answer() the
-        # moment it starts listening — anything already queued predates the
-        # question.
+        # still speaking (barge-in leftovers) — anything queued before the
+        # brain started listening predates the question. When a re-prompt
+        # is spoken the brain passes ``drop_before_ts`` instead, keeping
+        # transcripts that arrived while the re-prompt played.
+        keep: list[tuple[str, float, float]] = []
+        while not self._queue.empty():
+            try:
+                keep.append(self._queue.get_nowait())
+            except asyncio.QueueEmpty:
+                break
+        if drop_before_ts is not None:
+            # a re-prompt is in play: keep transcripts that arrived while it
+            # was spoken (>= drop_before_ts), discard everything older
+            keep = [it for it in keep if it[2] >= drop_before_ts]
+        else:
+            keep = []                     # default: drain all stale entries
+        for it in keep:
+            self._queue.put_nowait(it)
+        if timeout_s is None:
+            text, stt_ms, _ = await self._queue.get()
+        else:
+            text, stt_ms, _ = await asyncio.wait_for(
+                self._queue.get(), timeout=timeout_s)
+        return CandidateAnswer(text=text, stt_ms=stt_ms)
+
+
+class LiveKitReviewer:
+    """Page decisions for the review gate after a scored question (Retake /
+    Next). The worker pushes each control message; ``decide`` waits for one
+    decision with a bounded wait — a timeout (no choice) means the interview
+    advances. Mirrors LiveKitCandidate's stale-drop at the gate boundary so
+    a leftover decision never answers the next question's gate."""
+
+    def __init__(self) -> None:
+        self._queue: asyncio.Queue[str] = asyncio.Queue()
+
+    def push(self, decision: str) -> None:
+        if decision in ("next", "retake"):
+            self._queue.put_nowait(decision)
+
+    async def decide(self, question_id: str,
+                     timeout_s: float | None = None) -> str:
         while not self._queue.empty():
             try:
                 self._queue.get_nowait()
             except asyncio.QueueEmpty:
                 break
         if timeout_s is None:
-            text, stt_ms = await self._queue.get()
+            decision = await self._queue.get()
         else:
-            text, stt_ms = await asyncio.wait_for(
-                self._queue.get(), timeout=timeout_s)
-        return CandidateAnswer(text=text, stt_ms=stt_ms)
+            decision = await asyncio.wait_for(self._queue.get(),
+                                              timeout=timeout_s)
+        return decision if decision in ("next", "retake") else "next"
 
 
 class EchoGate:

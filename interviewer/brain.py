@@ -28,7 +28,11 @@ from interviewer.prompts import (
     build_system_prompt,
     build_wrap_prompt,
 )
-from interviewer.scoring import Evaluation, parse_evaluation
+from interviewer.scoring import (
+    Evaluation,
+    parse_evaluation,
+    verdict_from_scores,
+)
 from interviewer.state_machine import InterviewerEvent, Session, Turn
 from interviewer.voice.budget import LatencyBudgetTracker
 from interviewer.voice.protocols import AudioSink
@@ -43,11 +47,15 @@ class CandidateAnswer:
 
 class Candidate(Protocol):
     async def answer(self, question_id: str,
-                     timeout_s: float | None = None) -> CandidateAnswer:
+                     timeout_s: float | None = None,
+                     drop_before_ts: float | None = None) -> CandidateAnswer:
         """The candidate's spoken/text answer for one question. ``timeout_s``
         caps the wait (voice no-hang gate): implementations may raise
         ``TimeoutError`` when the limit is hit, or ignore it (scripted
-        candidates return instantly)."""
+        candidates return instantly). ``drop_before_ts`` (monotonic) makes
+        the candidate discard transcripts that arrived before that instant —
+        the brain uses it to keep an answer that arrived while the spoken
+        re-prompt played, instead of treating it as barge-in junk."""
 
 
 class ScriptedCandidate:
@@ -57,8 +65,19 @@ class ScriptedCandidate:
         self._answers = answers or {}
 
     async def answer(self, question_id: str,
-                     timeout_s: float | None = None) -> CandidateAnswer:
+                     timeout_s: float | None = None,
+                     drop_before_ts: float | None = None) -> CandidateAnswer:
         return CandidateAnswer(text=self._answers.get(question_id, ""))
+
+
+class Reviewer(Protocol):
+    async def decide(self, question_id: str,
+                     timeout_s: float | None = None) -> str:
+        """The review gate's decision after a question is scored (manual
+        answer mode): the candidate chooses ``"retake"`` (answer the same
+        question again — its score is replaced) or ``"next"`` (advance).
+        May raise ``TimeoutError`` when no choice arrives in time — the
+        interview then advances as if "next"."""
 
 
 class _EmptyFollowups:
@@ -89,6 +108,7 @@ PHASE_LABELS: dict[str, str] = {
     "transcribing": "⏳ Transcribing your answer…",
     "evaluating": "⏳ Evaluating your answer…",
     "scoring": "⏳ Recording your score…",
+    "review": "Answer scored — retake it or move to the next question",
     "wrap": "⏳ Preparing your feedback…",
 }
 
@@ -98,17 +118,21 @@ class LLMInterviewer:
                  max_questions: int = 2, followup_budget: int = 1,
                  spoken_max_chars: int = MAX_SPOKEN_CHARS,
                  answer_timeout_s: float = 60.0,
+                 review_timeout_s: float = 90.0,
                  # Phase 3 voice extensions (all optional — text mode needs none):
                  tts: Any = None,
                  voice_llm: OpenAICompatibleLLM | None = None,
                  budget: LatencyBudgetTracker | None = None,
                  sink: AudioSink | None = None,
-                 on_event: Callable[[dict], Awaitable[None]] | None = None):
+                 on_event: Callable[[dict], Awaitable[None]] | None = None,
+                 decider: Reviewer | None = None):
         self._rag = rag
         self._llm = llm
         self._session = session
         self._max_questions = max_questions
         self._answer_timeout_s = answer_timeout_s
+        self._review_timeout_s = review_timeout_s
+        self._decider = decider
         self._followup_budget = followup_budget
         self._spoken_max_chars = spoken_max_chars
         self._system_prompt = build_system_prompt(session.domain)
@@ -236,14 +260,20 @@ class LLMInterviewer:
         unanswered — the brain returns an empty answer, the judge evaluates
         it, and the interview moves on. The FSM therefore can never deadlock
         and always reaches ``wrap``."""
+        drop_before_ts: float | None = None
         for attempt in (1, 2):
             await self._phase("listening")
             try:
                 return await self._candidate.answer(
-                    question_id, timeout_s=self._answer_timeout_s)
+                    question_id, timeout_s=self._answer_timeout_s,
+                    drop_before_ts=drop_before_ts)
             except TimeoutError:
                 if attempt == 2:
                     return CandidateAnswer(text="")   # scored as unanswered
+                # The re-prompt invites an immediate answer: speech that
+                # arrives while it plays is a real answer, not barge-in junk —
+                # the second attempt must not drain it (RCA F1).
+                drop_before_ts = time.monotonic()
                 reprompt = await self._speak(build_reprompt_prompt())
                 self._session.turns.append(Turn("interviewer", reprompt))
                 await self._emit({"type": "turn", "role": "interviewer",
@@ -277,95 +307,138 @@ class LLMInterviewer:
         for i, ref in enumerate(bank.questions[:self._max_questions]):
             if i > 0:
                 s.transition(InterviewerEvent.MORE_QUESTIONS)
-            s.current_question_id = ref.question_id
-            s.transition(InterviewerEvent.QUESTION_ASKED)        # -> LISTEN
-
-            question = await self._rag.interview_question(doc_id, ref.question_id)
-            spoken_question = await self._speak(
-                build_question_prompt(question.formatted, ref.question_id))
-            s.turns.append(Turn("interviewer", spoken_question))
-            await self._emit({"type": "turn", "role": "interviewer",
-                              "text": spoken_question, "stage": "question"})
-            hops.append(self._hop("question", question_id=ref.question_id))
-
-            answer = await self._listen(ref.question_id)
-            self._last_stt_ms = answer.stt_ms
-            if answer.text.strip():
-                # The candidate's words are appended to the transcript; in
-                # voice mode the page already showed them as ``candidate_heard``
-                # (STT-first echo), so empty (unanswered) turns add nothing.
-                s.turns.append(Turn("candidate", answer.text))
-                await self._emit({"type": "turn", "role": "candidate",
-                                  "text": answer.text})
-            s.transition(InterviewerEvent.ANSWER_RECEIVED)       # -> EVALUATE
-
-            followup_asked = False
+            # Manual-answer retake loop: after the question is scored the
+            # review gate (if a decider exists) lets the candidate answer it
+            # again — the previous score for the question is replaced. With
+            # no decider the interview advances exactly as before.
             while True:
-                # Cache-gated rubric retrieval — repeated rubrics hit the
-                # RAG service's semantic cache (the Phase 1 gate metric).
-                await self._phase("evaluating")
-                rubric = await self._rag.agent_context(
-                    "", "", rubric_query=ref.section_title)
-                rubric_retrievals += 1
-                if rubric.get("hit_source") == "cache":
-                    rubric_cache_hits += 1
-                rag_ms = float((rubric.get("timings_ms") or {}).get("total", 0.0))
-                self._last_rag_ms = rag_ms
+                s.current_question_id = ref.question_id
+                s.transition(InterviewerEvent.QUESTION_ASKED)        # -> LISTEN
 
+                question = await self._rag.interview_question(
+                    doc_id, ref.question_id)
+                spoken_question = await self._speak(
+                    build_question_prompt(question.formatted, ref.question_id))
+                s.turns.append(Turn("interviewer", spoken_question))
+                await self._emit({"type": "turn", "role": "interviewer",
+                                  "text": spoken_question,
+                                  "stage": "question",
+                                  "question_id": ref.question_id})
+                hops.append(self._hop("question",
+                                      question_id=ref.question_id))
+
+                answer = await self._listen(ref.question_id)
+                self._last_stt_ms = answer.stt_ms
                 if answer.text.strip():
-                    followups = await self._rag.interview_followup(
-                        answer.text, domain=s.domain, top_k=3)
-                else:
-                    followups = _EmptyFollowups()   # nothing to retrieve against
+                    # The candidate's words are appended to the transcript;
+                    # in voice mode the page already showed them as
+                    # ``candidate_heard`` (STT-first echo), so empty
+                    # (unanswered) turns add nothing.
+                    s.turns.append(Turn("candidate", answer.text))
+                    await self._emit({"type": "turn", "role": "candidate",
+                                      "text": answer.text})
+                s.transition(InterviewerEvent.ANSWER_RECEIVED)       # -> EVALUATE
 
-                evaluation = await self._judge(build_evaluation_prompt(
-                    question.formatted, answer.text, rubric_context(rubric, followups)))
-                hops.append(self._hop("evaluate", question_id=ref.question_id,
-                                      rag_ms=rag_ms, rubric_hit_source=rubric.get("hit_source")))
+                followup_asked = False
+                while True:
+                    # Cache-gated rubric retrieval — repeated rubrics hit the
+                    # RAG service's semantic cache (the Phase 1 gate metric).
+                    await self._phase("evaluating")
+                    rubric = await self._rag.agent_context(
+                        "", "", rubric_query=ref.section_title)
+                    rubric_retrievals += 1
+                    if rubric.get("hit_source") == "cache":
+                        rubric_cache_hits += 1
+                    rag_ms = float((rubric.get("timings_ms") or {}).get("total", 0.0))
+                    self._last_rag_ms = rag_ms
 
-                if (evaluation.followup and not followup_asked
-                        and self._followup_budget > 0):
-                    followup_asked = True
-                    s.transition(InterviewerEvent.FOLLOWUP_NEEDED)   # -> FOLLOW_UP
-                    spoken_followup = await self._speak(
-                        build_followup_prompt(evaluation.followup))
-                    s.turns.append(Turn("interviewer", spoken_followup))
-                    await self._emit({"type": "turn", "role": "interviewer",
-                                      "text": spoken_followup,
-                                      "stage": "followup"})
-                    hops.append(self._hop("followup", question_id=ref.question_id))
-                    s.transition(InterviewerEvent.FOLLOWUP_ASKED)    # -> LISTEN
-                    followup_answer = await self._listen(
-                        f"{ref.question_id}:followup")
-                    self._last_stt_ms = followup_answer.stt_ms
-                    if followup_answer.text.strip():
-                        s.turns.append(Turn("candidate", followup_answer.text))
-                        await self._emit({"type": "turn", "role": "candidate",
-                                          "text": followup_answer.text})
-                    answer = followup_answer
-                    s.transition(InterviewerEvent.ANSWER_RECEIVED)   # -> EVALUATE
-                    continue    # judge the follow-up answer this round
-                break
+                    if answer.text.strip():
+                        followups = await self._rag.interview_followup(
+                            answer.text, domain=s.domain, top_k=3)
+                    else:
+                        followups = _EmptyFollowups()  # nothing to retrieve against
 
-            await self._phase("scoring")
-            s.scores.append({
-                "question_id": ref.question_id,
-                "section_title": ref.section_title,
-                "scores": evaluation.scores,
-                "justifications": evaluation.justifications,
-                "followup_asked": followup_asked,
-                "raw_evaluation": evaluation.justifications[:500],
-            })
-            # per-question score event: the page's scoreboard grows after
-            # every question, never only at the final summary (RCA R3).
-            await self._emit({"type": "score", "score": {
-                "question_id": ref.question_id,
-                "section_title": ref.section_title,
-                "scores": evaluation.scores,
-                "followup_asked": followup_asked,
-            }})
-            s.transition(InterviewerEvent.NO_FOLLOWUP)               # -> SCORE
-            s.transition(InterviewerEvent.SCORING_DONE)              # -> NEXT
+                    evaluation = await self._judge(build_evaluation_prompt(
+                        question.formatted, answer.text,
+                        rubric_context(rubric, followups)))
+                    hops.append(self._hop(
+                        "evaluate", question_id=ref.question_id, rag_ms=rag_ms,
+                        rubric_hit_source=rubric.get("hit_source")))
+
+                    if (evaluation.followup and not followup_asked
+                            and self._followup_budget > 0):
+                        followup_asked = True
+                        s.transition(InterviewerEvent.FOLLOWUP_NEEDED)  # -> FOLLOW_UP
+                        spoken_followup = await self._speak(
+                            build_followup_prompt(evaluation.followup))
+                        s.turns.append(Turn("interviewer", spoken_followup))
+                        await self._emit({"type": "turn", "role": "interviewer",
+                                          "text": spoken_followup,
+                                          "stage": "followup"})
+                        hops.append(self._hop("followup",
+                                              question_id=ref.question_id))
+                        s.transition(InterviewerEvent.FOLLOWUP_ASKED)   # -> LISTEN
+                        followup_answer = await self._listen(
+                            f"{ref.question_id}:followup")
+                        self._last_stt_ms = followup_answer.stt_ms
+                        if followup_answer.text.strip():
+                            s.turns.append(Turn("candidate",
+                                                followup_answer.text))
+                            await self._emit({"type": "turn",
+                                              "role": "candidate",
+                                              "text": followup_answer.text})
+                        answer = followup_answer
+                        s.transition(InterviewerEvent.ANSWER_RECEIVED)  # -> EVALUATE
+                        continue    # judge the follow-up answer this round
+                    break
+
+                await self._phase("scoring")
+                verdict = evaluation.verdict or verdict_from_scores(
+                    evaluation.scores)
+                model_answer = evaluation.model_answer
+                gap = evaluation.justifications[:300]
+                s.scores.append({
+                    "question_id": ref.question_id,
+                    "section_title": ref.section_title,
+                    "scores": evaluation.scores,
+                    "justifications": evaluation.justifications,
+                    "followup_asked": followup_asked,
+                    "raw_evaluation": evaluation.justifications[:500],
+                    "verdict": verdict,
+                    "model_answer": model_answer,
+                })
+                # per-question score event: the page's scoreboard grows after
+                # every question, never only at the final summary (RCA R3),
+                # and carries the review-gate feedback (verdict + model
+                # answer) the student sees before Retake / Next.
+                await self._emit({"type": "score", "score": {
+                    "question_id": ref.question_id,
+                    "section_title": ref.section_title,
+                    "scores": evaluation.scores,
+                    "followup_asked": followup_asked,
+                    "verdict": verdict,
+                    "model_answer": model_answer,
+                    "gap": gap,
+                }})
+                s.transition(InterviewerEvent.NO_FOLLOWUP)           # -> SCORE
+                s.transition(InterviewerEvent.SCORING_DONE)          # -> NEXT
+
+                # ── review gate (manual answer mode) ────────────────────────
+                if self._decider is None:
+                    break
+                await self._phase("review")
+                try:
+                    decision = await self._decider.decide(
+                        ref.question_id, timeout_s=self._review_timeout_s)
+                except TimeoutError:
+                    break                       # no choice -> advance
+                if decision != "retake":
+                    break
+                # Retake: drop this question's previous score entry, then
+                # re-ask from scratch (this loop re-runs the question).
+                s.scores = [e for e in s.scores
+                            if e["question_id"] != ref.question_id]
+                s.transition(InterviewerEvent.MORE_QUESTIONS)   # NEXT -> ASK
 
         s.transition(InterviewerEvent.NO_MORE_QUESTIONS)             # -> WRAP
         avg = 0.0

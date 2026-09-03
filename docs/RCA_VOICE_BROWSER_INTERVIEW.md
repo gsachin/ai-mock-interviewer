@@ -41,6 +41,19 @@ page served HTTP 200, inline JS passes `node --check`.
 (3 questions, qwen2.5:14b judge with `INTERVIEW_JUDGE_MODEL` override added,
 compact summary transport, page-side AEC + agent-side gate).
 
+**Follow-up (2026-09-03, evening) — manual answer mode supersedes VAD capture:**
+per product direction, the browser flow now uses an explicit **Start answer /
+Finish** toggle (mic buffered only while armed — no VAD auto-endpointing), the
+toggle is disabled while the interviewer speaks and re-enables on `listening`
+(and after the 60 s re-prompt), and every scored question ends at a **review
+gate** with **↻ Retake answer** (same question re-asked, score replaced) and
+**Next question ▶**; after the wrap the toggle becomes **Finish session**.
+Implemented in `interviewer/voice/agent.py` (control channel + buffer),
+`brain.py` (decider/review gate, re-prompt `drop_before_ts`), `voice/livekit.py`
+(`LiveKitReviewer`), `web/index.html`; 71 unit tests green, manual-protocol E2E
+PASSED (3 questions, gate-advanced, `ended`). Browser-with-mic verification is
+still the open item (DONE_AND_PENDING.md P-A).
+
 ---
 
 ## 1. Symptom map (what the user reported → what it means)

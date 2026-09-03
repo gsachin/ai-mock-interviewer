@@ -17,7 +17,12 @@ from interviewer.voice.audio_format import (
     wav_to_s16le48k,
 )
 from interviewer.voice.interviewer import AudioCandidate
-from interviewer.voice.livekit import EchoGate, LiveKitAudioSink, LiveKitCandidate
+from interviewer.voice.livekit import (
+    EchoGate,
+    LiveKitAudioSink,
+    LiveKitCandidate,
+    LiveKitReviewer,
+)
 from interviewer.voice.stt import resolve_stt
 from interviewer.voice.tts import resolve_tts
 
@@ -326,3 +331,96 @@ def test_voice_factory_threads_session_config(monkeypatch):
     assert iv._max_questions == 3
     assert iv._answer_timeout_s == 12.5
     assert captured["cfg"].model == "qwen2.5:3b"   # judge override wins
+
+
+# ── Manual answer capture plumbing (2026-09-03) ──────────────────────────────
+
+def test_candidate_drop_before_keeps_reprompt_window_answers():
+    """F1: transcripts that arrived during the spoken re-prompt (>= the
+    brain's drop_before_ts) survive; earlier barge-in leftovers drain."""
+    import time as _time
+
+    candidate = LiveKitCandidate()
+    candidate.push("leftover from the question speech", 0.0)
+    drop_before = _time.monotonic() + 0.05   # recorded before the re-prompt
+    ans = run(_late(candidate, drop_before))
+    assert ans.text == "the real answer spoken during the re-prompt"
+    assert ans.stt_ms == 250.0
+
+
+async def _late(candidate, drop_before):
+    await asyncio.sleep(0.08)      # the leftover predates the re-prompt
+    candidate.push("the real answer spoken during the re-prompt", 250.0)
+    return await candidate.answer("s1", timeout_s=1.0,
+                                  drop_before_ts=drop_before)
+
+
+def test_candidate_drop_before_none_drains_all():
+    """Default (no re-prompt): anything queued before the brain listens is
+    barge-in junk and must not answer the question."""
+    candidate = LiveKitCandidate()
+    candidate.push("sorry, go on", 100.0)
+    with pytest.raises(TimeoutError):
+        run(candidate.answer("s1", timeout_s=0.05))
+
+
+# ── LiveKitReviewer (Retake / Next gate channel) ─────────────────────────────
+
+def test_reviewer_delivers_decision_and_drops_stale():
+    reviewer = LiveKitReviewer()
+    reviewer.push("retake")                    # stale: no gate was open
+
+    async def scenario():
+        task = asyncio.create_task(reviewer.decide("s1", timeout_s=1.0))
+        await asyncio.sleep(0)                 # decide() drains the stale item
+        reviewer.push("next")
+        return await task
+
+    assert run(scenario()) == "next"
+
+
+def test_reviewer_times_out_when_no_choice():
+    reviewer = LiveKitReviewer()
+    with pytest.raises(TimeoutError):
+        run(reviewer.decide("s1", timeout_s=0.05))
+
+
+# ── silence trimming (RCA 2026-09-03: whisper decoding thinking-time
+#    silence cost minutes of CPU — trim to the speech region first) ──────────
+
+def _pcm_from_frames(samples: list[float]) -> bytes:
+    """samples at 16 kHz in [-1, 1] -> s16le mono bytes."""
+    import numpy as _np
+    return (_np.clip(_np.asarray(samples, dtype=_np.float32), -1, 1)
+            * 32767).astype("<i2").tobytes()
+
+
+def test_trim_keeps_only_the_speech_region():
+    from interviewer.voice.trim import speech_span, trim_speech_buffer
+
+    quiet = [0.001] * (16000 * 3)              # 3 s of room floor
+    speech = [0.6] * (16000 * 2)               # 2 s of loud speech
+    tail = [0.002] * (16000 * 2)               # 2 s of trailing silence
+    pcm = _pcm_from_frames(quiet + speech + tail)
+
+    start, end = speech_span(pcm)
+    assert start >= 0 and end <= len(pcm) // 2
+    trimmed = trim_speech_buffer(pcm)
+    # loud region preserved, silence removed: trimmed is ~2-3 s, not 7 s
+    assert 16000 * 1.5 <= len(trimmed) // 2 <= 16000 * 4
+    # no all-quiet buffer survives
+    assert trim_speech_buffer(_pcm_from_frames(quiet)) == b""
+    assert speech_span(b"") is None
+
+
+def test_trim_detects_short_4_word_answer():
+    """The reported case: a 4-5 word answer buried in thinking silence must
+    survive trimming (speech frames run far above the 0.006 floor)."""
+    from interviewer.voice.trim import trim_speech_buffer
+
+    quiet = [0.002] * (16000 * 45)             # 45 s of silence (thinking)
+    words = [0.5, 0.5, 0.5, -0.5, 0.5, -0.5, 0.5, 0.5] * 1600  # ~0.8 s
+    pcm = _pcm_from_frames(quiet + words)
+    trimmed = trim_speech_buffer(pcm)
+    assert len(trimmed) // 2 >= 16000 * 0.3    # the words survived
+    assert len(trimmed) // 2 <= 16000 * 4

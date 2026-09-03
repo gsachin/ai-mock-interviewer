@@ -5,11 +5,17 @@ The guarded import keeps the package usable without audio infrastructure:
 it raises a clear error instead of a silent failure.
 
 Wiring (a plain entrypoint coroutine — no pipeline Agent subclass):
-  room audio -> VAD (silero, 16 kHz mono) -> utterance-end speech buffer ->
-  STT engine (faster-whisper / deepgram) -> LiveKitCandidate ->
-  LLMInterviewer (RAG over MCP, fast voice LLM, sentence-level TTS) ->
-  LiveKitAudioSink -> room playback, with barge-in: candidate speech during
-  an interviewer turn interrupts playback and generation.
+  room audio -> **manual answer capture** -> STT engine (faster-whisper /
+  deepgram) -> LiveKitCandidate -> LLMInterviewer (RAG over MCP, fast voice
+  LLM, sentence-level TTS) -> LiveKitAudioSink -> room playback.
+
+Manual capture (the browser's Start answer / Finish answer toggle): the
+page's mic track is published continuously, but the worker only buffers
+frames while an ``answer_start`` control message has armed it. ``Finish``
+transcribes the buffered interval and feeds it to the brain — no VAD
+auto-endpointing, so a quiet or gated mic can never swallow an answer the
+candidate deliberately recorded. ``Retake`` / ``Next`` control messages
+feed the brain's review gate (the decider) after each scored question.
 """
 import asyncio
 import json
@@ -18,7 +24,6 @@ import time
 
 try:
     from livekit import agents, rtc  # type: ignore  # optional [voice] extra
-    from livekit.plugins import silero  # type: ignore
 except ImportError as exc:  # pragma: no cover - import-time guard
     raise ImportError(
         "livekit-agents is required for the voice worker — "
@@ -30,12 +35,21 @@ from interviewer.config import InterviewerConfig
 from interviewer.rag_client import RagClient
 from interviewer.state_machine import Session
 from interviewer.voice.interviewer import build_voice_interviewer
-from interviewer.voice.livekit import EchoGate, LiveKitAudioSink, LiveKitCandidate
+from interviewer.voice.livekit import (
+    LiveKitAudioSink,
+    LiveKitCandidate,
+    LiveKitReviewer,
+)
 from interviewer.voice.stt import resolve_stt
+from interviewer.voice.trim import trim_speech_buffer
 
 log = logging.getLogger(__name__)
 
 DOMAINS = ("system-design", "ios", "dsa", "devops")
+
+# Manual-capture bounds: 16 kHz mono s16le = 32 KB/s.
+MAX_ANSWER_SECONDS = 120           # safety cap on one recorded answer
+_MIN_ANSWER_BYTES = int(0.3 * 16000 * 2)  # shorter buffers are not an answer
 
 
 def domain_from_room(room_name: str, default: str = "system-design") -> str:
@@ -56,8 +70,9 @@ def is_page_event(event: dict) -> bool:
 
 async def run_agent(ctx: agents.JobContext) -> None:
     """One room, one interview: build the voice brain, stream its sentences
-    into the room, transcribe candidate utterances (VAD -> STT -> candidate
-    queue), and barge in when the candidate speaks over the interviewer."""
+    into the room, capture answers the candidate records with the page's
+    Start answer / Finish answer toggle, and let the page's Retake / Next
+    choices drive the review gate between scored questions."""
     await ctx.connect()
     participant = await ctx.wait_for_participant()
     log.info("candidate joined: %s", participant.identity)
@@ -69,7 +84,6 @@ async def run_agent(ctx: agents.JobContext) -> None:
         track, rtc.TrackPublishOptions(
             source=rtc.TrackSource.SOURCE_MICROPHONE))
     sink = LiveKitAudioSink(source, rtc=rtc)
-    gate = EchoGate()          # acoustic echo guard (T6) — uses sink.playing
 
     config = InterviewerConfig.from_env()
     domain = domain_from_room(ctx.room.name)
@@ -88,9 +102,13 @@ async def run_agent(ctx: agents.JobContext) -> None:
         copy too would duplicate the transcript."""
         if not is_page_event(event):
             return
+        # Session audit trail: every event the page receives, timestamped by
+        # the log formatter — conversation + workflow analysis replays this.
+        log.info("event -> page: %s",
+                 json.dumps(event, ensure_ascii=False)[:300])
         try:
-            # the brain task and the VAD consumer publish concurrently —
-            # serialize so packets never interleave on the wire
+            # the brain task and the audio/control handlers publish
+            # concurrently — serialize so packets never interleave
             async with publish_lock:
                 await ctx.room.local_participant.publish_data(
                     json.dumps(event).encode(), reliable=True,
@@ -98,84 +116,138 @@ async def run_agent(ctx: agents.JobContext) -> None:
         except Exception:
             log.exception("data publish failed")
 
+    reviewer = LiveKitReviewer()
     interviewer = build_voice_interviewer(config, rag, session, sink=sink,
-                                          on_event=publish_event)
+                                          on_event=publish_event,
+                                          decider=reviewer)
     candidate = LiveKitCandidate()
     # One STT engine per room: faster-whisper keeps its model warm across
-    # utterances (re-resolving per utterance would reload it every time).
+    # answers (re-resolving per answer would reload it every time).
     stt = resolve_stt(config.stt_provider, config)
 
-    vad = silero.VAD.load(sample_rate=16000, activation_threshold=0.5)
-    vad_stream = vad.stream()
+    # ── manual answer capture ───────────────────────────────────────────────
+    # Mutable capture state shared by the closures below (a dict so nested
+    # handlers never fight Python's nonlocal binding rules).
+    cap: dict = {"armed": False, "buffer": bytearray(), "busy": False}
+    _max_buffer = MAX_ANSWER_SECONDS * 16000 * 2
 
-    async def _consume_vad() -> None:
-        """VAD events arrive by iterating the stream (push_frame is
-        fire-and-forget). START_OF_SPEECH = barge-in (gated by EchoGate — the
-        interviewer's own voice never interrupts itself); END_OF_SPEECH
-        carries the buffered speech frame -> STT -> ``candidate_heard`` echo
-        -> the brain's candidate queue. The page sees ``state: transcribing``
-        while STT runs and ``candidate_heard`` the instant it returns, so the
-        candidate's words appear even if the brain later stalls (RCA 3.0.1)."""
+    async def _notice(text: str) -> None:
+        """A soft, non-transcript message (the page shows it as a status)."""
+        await publish_event({"type": "notice", "text": text})
+
+    async def _transcribe_answer() -> None:
+        """Transcribe the recorded interval (Finish answer) and feed the
+        brain. Emits ``state: transcribing`` while STT runs and
+        ``candidate_heard`` the instant it returns (RCA 3.0.1).
+
+        RCA 2026-09-03 (multi-minute "Transcribing…"): the armed buffer
+        holds everything between Start answer and Finish — including
+        thinking-time silence, which whisper decodes at roughly 0.15-0.25x
+        real time on CPU int8 (35 s for 150 s of quiet). The buffer is
+        energy-trimmed to the speech region FIRST so a short spoken answer
+        stays a ~1-3 s decode."""
+        pcm = bytes(cap["buffer"])
+        raw_seconds = len(pcm) / 32000.0
+        cap["buffer"] = bytearray()
+        cap["armed"] = False
+        if len(pcm) < _MIN_ANSWER_BYTES:
+            await _notice("No speech detected — click Start answer and "
+                          "try again.")
+            return
+        pcm = trim_speech_buffer(pcm)      # silence trim (thinking time etc.)
+        if len(pcm) < _MIN_ANSWER_BYTES:
+            log.info("answer had no speech: %.1f s recorded, trimmed to "
+                     "%.1f s", raw_seconds, len(pcm) / 32000.0)
+            await _notice("No speech detected — click Start answer and "
+                          "try again.")
+            return
+        log.info("answer: %.1f s recorded -> %.1f s of speech to transcribe",
+                 raw_seconds, len(pcm) / 32000.0)
+        await publish_event({
+            "type": "state", "phase": "transcribing",
+            "label": PHASE_LABELS["transcribing"]})
+        t0 = time.perf_counter()
+        text = ""
         try:
-            async for vad_ev in vad_stream:
-                now = time.time()
-                if vad_ev.type == agents.vad.VADEventType.START_OF_SPEECH:
-                    if gate.on_speech_start(now, sink.playing):
-                        # barge-in: stop playback/generation (no-op when the
-                        # interviewer is not speaking)
-                        await interviewer.interrupt()
-                elif vad_ev.type == agents.vad.VADEventType.END_OF_SPEECH:
-                    if not vad_ev.frames:
-                        continue
-                    # the frames are 16 kHz mono s16le (the VAD input rate)
-                    frames_ms = (sum(len(f.data) for f in vad_ev.frames)
-                                 / 2 / 16.0)   # samples / 16 kHz -> ms
-                    stop_ago_ms = ((now - sink.last_stop_ts) * 1000.0
-                                   if sink.last_stop_ts else float("inf"))
-                    if gate.on_speech_end(now, sink.playing, stop_ago_ms):
-                        log.info("echo tail dropped (%d ms utterance, "
-                                 "%.0f ms after playback stop)",
-                                 frames_ms, stop_ago_ms)
-                        continue
-                    await publish_event({
-                        "type": "state", "phase": "transcribing",
-                        "label": PHASE_LABELS["transcribing"]})
-                    pcm = b"".join(f.data for f in vad_ev.frames)
-                    t0 = time.perf_counter()
-                    text = ""
-                    try:
-                        text = await stt.transcribe(pcm)
-                    except Exception:
-                        log.exception("STT failed for utterance")
-                    stt_ms = (time.perf_counter() - t0) * 1000
-                    if text:
-                        log.info("candidate said (%d ms): %r",
-                                 stt_ms, text[:80])
-                        # STT-first echo: the page renders the candidate's
-                        # words immediately, before the brain consumes them.
-                        await publish_event({
-                            "type": "candidate_heard", "text": text})
-                        candidate.push(text, stt_ms)
+            text = await stt.transcribe(pcm)
         except Exception:
-            log.exception("vad consumer failed")
+            log.exception("STT failed for recorded answer")
+        stt_ms = (time.perf_counter() - t0) * 1000
+        if not text.strip():
+            await _notice("No speech detected — click Start answer and "
+                          "try again.")
+            return
+        log.info("candidate said (%d ms): %r", stt_ms, text[:80])
+        await publish_event({"type": "candidate_heard", "text": text})
+        candidate.push(text, stt_ms)
+
+    async def _on_control(msg: dict) -> None:
+        """The browser's Start answer / Finish answer / Retake / Next."""
+        typ = msg.get("type")
+        if typ == "answer_start":
+            cap["armed"] = True
+            cap["buffer"] = bytearray()
+            log.info("answer armed — buffering the candidate's mic")
+        elif typ == "answer_cancel":
+            cap["armed"] = False
+            cap["buffer"] = bytearray()
+            log.info("answer cancelled — buffer cleared")
+        elif typ == "answer_finish":
+            if cap["busy"]:
+                return                        # a Finish is already in flight
+            cap["busy"] = True
+            try:
+                await _transcribe_answer()
+            except Exception:
+                log.exception("answer transcription failed")
+                await _notice("Sorry — your answer could not be processed. "
+                              "Click Start answer and try again.")
+            finally:
+                cap["busy"] = False
+        elif typ in ("next", "retake"):
+            reviewer.push(typ)
+            log.info("review decision: %s", typ)
+        else:
+            log.debug("unknown control message: %r", msg)
+
+    def _on_data(packet: rtc.DataPacket) -> None:
+        """Candidate data packets. We only ever receive the page's control
+        messages, so the topic is logged for diagnosis but NOT filtered —
+        the received topic shape is SDK/server dependent and a strict check
+        silently ate every message (the same fragile-filter bug the page had,
+        RCA R2)."""
+        try:
+            msg = json.loads(packet.data.decode())
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            log.debug("undecodable data packet (topic=%r)", packet.topic)
+            return
+        if not isinstance(msg, dict) or "type" not in msg:
+            log.debug("non-control data packet (topic=%r): %r",
+                      packet.topic, msg)
+            return
+        log.info("control received: %s (topic=%r)", msg["type"],
+                 packet.topic)
+        asyncio.create_task(_on_control(msg))
 
     async def listen() -> None:
-        """Push candidate audio frames into the VAD stream (16 kHz mono —
-        the AudioStream resamples)."""
+        """Stream the candidate's mic (16 kHz mono) into the armed buffer —
+        nothing is transcribed until the page sends Finish answer."""
         try:
             stream = await _candidate_audio_stream(participant)
         except Exception:
             log.exception("no candidate audio stream")
             return
         log.info("candidate audio stream attached")
-        consumer = asyncio.create_task(_consume_vad())
         try:
             async for ev in stream:
-                vad_stream.push_frame(ev.frame)
+                if cap["armed"]:
+                    cap["buffer"].extend(ev.frame.data)
+                    if len(cap["buffer"]) > _max_buffer:   # safety cap
+                        log.warning("answer buffer capped at %d s — "
+                                    "truncating", MAX_ANSWER_SECONDS)
+                        del cap["buffer"][:len(cap["buffer"]) - _max_buffer]
         except Exception:
             log.exception("audio listen loop failed")
-        finally:
-            consumer.cancel()
 
     disconnected = asyncio.Event()
 
@@ -189,6 +261,7 @@ async def run_agent(ctx: agents.JobContext) -> None:
         disconnected.set()
 
     ctx.room.on("participant_disconnected", _on_disconnect)
+    ctx.room.on("data_received", _on_data)
     ctx.add_shutdown_callback(_on_shutdown)
     log.info("agent in room %r (domain=%s) — interviewer starting",
              ctx.room.name, domain)
@@ -232,7 +305,7 @@ async def run_agent(ctx: agents.JobContext) -> None:
 
 async def _candidate_audio_stream(participant: rtc.RemoteParticipant) -> rtc.AudioStream:
     """Wait for the candidate's subscribed audio track, then stream it as
-    16 kHz mono (the silero VAD's input format)."""
+    16 kHz mono s16le (the manual-capture buffer format)."""
     while True:
         for publication in list(participant.track_publications.values()):
             if (publication.kind == rtc.TrackKind.KIND_AUDIO

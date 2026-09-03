@@ -43,6 +43,8 @@ Correctness: <1-5>
 Depth: <1-5>
 Communication: <1-5>
 Justification: one sentence on the strongest gap.
+Verdict: correct | partial | incorrect
+Model answer: 2-4 short sentences giving the correct, complete answer (state key mechanisms and trade-offs; plain text, no markdown, no lists).
 FOLLOW_UP: one short question if any key concept is missing, otherwise: none"""
 
 

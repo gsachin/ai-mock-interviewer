@@ -214,3 +214,165 @@ def test_answer_timeout_reprompts_once_then_moves_on():
     # unanswered questions went through the judge (evaluating phases exist)
     phases = [e["phase"] for e in events if e["type"] == "state"]
     assert phases.count("evaluating") == 2
+
+
+# ── Manual answer review gate (Retake / Next) ────────────────────────────────
+# After every scored question the brain pauses at the review gate when a
+# decider is present: "retake" re-asks the same question and replaces its
+# score; "next" (or a gate timeout) advances. With no decider the flow is
+# byte-for-byte the original automated one.
+
+EVAL_NONE2 = EVAL_NONE  # readability alias
+
+
+class _FakeDecider:
+    """Canned review decisions, recorded per gate."""
+
+    def __init__(self, decisions: list[str]):
+        self._decisions = list(decisions)
+        self.calls: list[str] = []
+
+    async def decide(self, question_id: str,
+                     timeout_s: float | None = None) -> str:
+        self.calls.append(question_id)
+        return self._decisions.pop(0) if self._decisions else "next"
+
+
+def test_review_gate_retake_replaces_score_then_next():
+    """A Retake re-asks the same question (same question_id turn) and its new
+    score replaces the old ledger entry; Next advances to the next question."""
+    rag = StubRag(["Rate limiter", "Consistent hashing"])
+    # speech script: greeting, q1, q1-retake, q2, wrap
+    llm = StubLLM(
+        ["Welcome to your system design interview.",
+         "Design a rate limiter for a public API.",
+         "Design a rate limiter for a public API.",     # retake re-ask
+         "Explain consistent hashing.",
+         "Closing remarks. Your average score was 4.0."],
+        [EVAL_NONE2, EVAL_NONE2, EVAL_NONE2])            # 3 judged attempts
+    events: list[dict] = []
+
+    async def collect(ev: dict) -> None:
+        events.append(ev)
+
+    decider = _FakeDecider(["retake", "next", "next"])
+    interviewer = LLMInterviewer(
+        rag, llm, Session(session_id="gate", tenant_id="default",
+                          domain="system-design"),
+        decider=decider, on_event=collect)
+    summary = run(interviewer.run("bank-sd", answers={
+        "s1": "token bucket with redis counters",
+        "s2": "virtual nodes minimize reshuffling",
+    }))
+
+    assert summary["state"] == InterviewerState.WRAP.value
+    # the gate saw every question, and q1's retake came back before advancing
+    assert decider.calls == ["s1", "s1", "s2"]
+    # retake replaced the entry: one score per question, in order
+    assert [e["question_id"] for e in summary["scores"]] == ["s1", "s2"]
+    # the question was asked twice (same question_id turn), then q2 once
+    q_turns = [e["question_id"] for e in events
+               if e.get("stage") == "question"]
+    assert q_turns == ["s1", "s1", "s2"]
+    # review phases shown at each gate; score events for every attempt
+    phases = [e["phase"] for e in events if e["type"] == "state"]
+    assert phases.count("review") == 3
+    assert [e["score"]["question_id"] for e in events
+            if e["type"] == "score"] == ["s1", "s1", "s2"]
+
+
+def test_no_decider_keeps_automated_flow():
+    """Text mode / headless runs pass no decider: no review phase at all."""
+    rag = StubRag(["Rate limiter"])
+    llm = StubLLM(
+        ["Welcome to your system design interview.",
+         "Design a rate limiter for a public API.",
+         "Closing remarks. Your average score was 4.0."],
+        [EVAL_NONE2])
+    events: list[dict] = []
+
+    async def collect(ev: dict) -> None:
+        events.append(ev)
+
+    interviewer = LLMInterviewer(
+        rag, llm, Session(session_id="autof", tenant_id="default",
+                          domain="system-design"),
+        on_event=collect)
+    summary = run(interviewer.run("bank-sd", answers={
+        "s1": "token bucket with redis counters"}))
+
+    assert summary["state"] == InterviewerState.WRAP.value
+    assert not any(e.get("phase") == "review" for e in events)
+
+
+class _ProbeCandidate:
+    """Records how the brain bounds each answer wait."""
+
+    def __init__(self):
+        self.calls: list[tuple[float | None, float | None]] = []
+
+    async def answer(self, question_id: str, timeout_s: float | None = None,
+                     drop_before_ts: float | None = None):
+        from interviewer.brain import CandidateAnswer
+        self.calls.append((timeout_s, drop_before_ts))
+        raise TimeoutError()
+
+
+def test_listen_second_attempt_keeps_reprompt_window():
+    """F1: the re-prompt's answer must not be drained as barge-in junk — the
+    second attempt passes a drop_before_ts so only pre-re-prompt transcripts
+    are discarded."""
+    rag = StubRag(["Rate limiter"])
+    llm = StubLLM(
+        ["Welcome to your system design interview.",
+         "Design a rate limiter for a public API.",
+         "Sorry, I did not catch that. Could you repeat?",
+         "Closing remarks. Your average score was 2.0."],
+        [EVAL_NONE2])
+    probe = _ProbeCandidate()
+    interviewer = LLMInterviewer(
+        rag, llm, Session(session_id="f1", tenant_id="default",
+                          domain="system-design"),
+        answer_timeout_s=0.05)
+    summary = run(interviewer.run("bank-sd", candidate=probe))
+
+    assert summary["state"] == InterviewerState.WRAP.value
+    assert len(probe.calls) == 2
+    first_timeout, first_drop = probe.calls[0]
+    second_timeout, second_drop = probe.calls[1]
+    assert second_drop is not None and first_drop is None
+    assert second_drop >= 0 and second_timeout == 0.05
+
+
+def test_score_event_carries_feedback():
+    """Per-question feedback (verdict + model answer) rides on the score
+    event so the review gate can show Correct / Partial / Incorrect + the
+    model answer without any extra LLM round-trip."""
+    rag = StubRag(["Rate limiter"])
+    llm = StubLLM(
+        ["Welcome.", "Design a rate limiter.", "Closing. 4.0."],
+        ["Correctness: 4\nDepth: 3\nCommunication: 4\n"
+         "Verdict: partial\n"
+         "Model answer: Use a token bucket with Redis counters.\n"
+         "FOLLOW_UP: none"])
+    events: list[dict] = []
+
+    async def collect(ev: dict) -> None:
+        events.append(ev)
+
+    interviewer = LLMInterviewer(
+        rag, llm, Session(session_id="fb", tenant_id="default",
+                          domain="system-design"),
+        on_event=collect)
+    summary = run(interviewer.run("bank-sd", answers={
+        "s1": "token bucket"}))
+
+    score_ev = [e for e in events if e["type"] == "score"]
+    assert len(score_ev) == 1
+    payload = score_ev[0]["score"]
+    assert payload["verdict"] == "partial"
+    assert payload["model_answer"] == "Use a token bucket with Redis counters."
+    assert payload["gap"]
+    # ledger row carries the same feedback for review after the call
+    assert summary["scores"][0]["verdict"] == "partial"
+    assert summary["scores"][0]["model_answer"] == "Use a token bucket with Redis counters."

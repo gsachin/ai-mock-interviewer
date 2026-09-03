@@ -42,6 +42,13 @@ class InterviewerConfig:
     livekit_url: str = "http://127.0.0.1:7880"
     livekit_api_key: str | None = None      # dev mode: "devkey"
     livekit_api_secret: str | None = None   # dev mode: "secret"
+    # RCA fixes (2026-09-03): session shape + no-hang guarantees.
+    max_questions: int = 3      # spoken questions per voice session
+    answer_timeout_s: float = 60.0  # per-answer wait; then one re-prompt, then
+                                # the question is scored as unanswered
+    judge_model: str | None = None  # override the judge LLM model on the
+                                # same base URL (a faster model is a latency
+                                # lever; None = the configured llm_model)
 
     @classmethod
     def from_env(cls, environ: dict[str, str] | None = None) -> "InterviewerConfig":
@@ -73,4 +80,7 @@ class InterviewerConfig:
             livekit_url=env.get("LIVEKIT_URL", "http://127.0.0.1:7880"),
             livekit_api_key=env.get("LIVEKIT_API_KEY"),
             livekit_api_secret=env.get("LIVEKIT_API_SECRET"),
+            max_questions=int(env.get("INTERVIEW_MAX_QUESTIONS", "3")),
+            answer_timeout_s=float(env.get("INTERVIEW_ANSWER_TIMEOUT_S", "60")),
+            judge_model=env.get("INTERVIEW_JUDGE_MODEL"),
         )

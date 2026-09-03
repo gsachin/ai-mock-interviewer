@@ -125,6 +125,8 @@ async def voice_token(body: VoiceTokenRequest) -> dict[str, Any]:
         "room": room,
         "session_id": session.session_id,
         "domain": domain,
+        # session shape — the page shows "Question n of Y" (RCA 7.4)
+        "max_questions": config.max_questions,
     }
 
 

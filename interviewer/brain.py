@@ -24,6 +24,7 @@ from interviewer.prompts import (
     build_followup_prompt,
     build_greeting_prompt,
     build_question_prompt,
+    build_reprompt_prompt,
     build_system_prompt,
     build_wrap_prompt,
 )
@@ -41,7 +42,12 @@ class CandidateAnswer:
 
 
 class Candidate(Protocol):
-    async def answer(self, question_id: str) -> CandidateAnswer: ...
+    async def answer(self, question_id: str,
+                     timeout_s: float | None = None) -> CandidateAnswer:
+        """The candidate's spoken/text answer for one question. ``timeout_s``
+        caps the wait (voice no-hang gate): implementations may raise
+        ``TimeoutError`` when the limit is hit, or ignore it (scripted
+        candidates return instantly)."""
 
 
 class ScriptedCandidate:
@@ -50,7 +56,8 @@ class ScriptedCandidate:
     def __init__(self, answers: dict[str, str] | None = None):
         self._answers = answers or {}
 
-    async def answer(self, question_id: str) -> CandidateAnswer:
+    async def answer(self, question_id: str,
+                     timeout_s: float | None = None) -> CandidateAnswer:
         return CandidateAnswer(text=self._answers.get(question_id, ""))
 
 
@@ -73,10 +80,24 @@ def rubric_context(rubric: dict[str, Any], followups: Any) -> str:
     return text[:3000] or "(no rubric context retrieved)"
 
 
+# RCA fix (2026-09-03): the page-facing phase protocol. Every backend phase
+# emits a ``state`` event whose label the page shows as a spinner — the
+# student always sees *something* between spoken turns.
+PHASE_LABELS: dict[str, str] = {
+    "speaking": "Interviewer speaking…",
+    "listening": "🎙 Listening — please answer aloud…",
+    "transcribing": "⏳ Transcribing your answer…",
+    "evaluating": "⏳ Evaluating your answer…",
+    "scoring": "⏳ Recording your score…",
+    "wrap": "⏳ Preparing your feedback…",
+}
+
+
 class LLMInterviewer:
     def __init__(self, rag: Any, llm: OpenAICompatibleLLM, session: Session, *,
                  max_questions: int = 2, followup_budget: int = 1,
                  spoken_max_chars: int = MAX_SPOKEN_CHARS,
+                 answer_timeout_s: float = 60.0,
                  # Phase 3 voice extensions (all optional — text mode needs none):
                  tts: Any = None,
                  voice_llm: OpenAICompatibleLLM | None = None,
@@ -87,6 +108,7 @@ class LLMInterviewer:
         self._llm = llm
         self._session = session
         self._max_questions = max_questions
+        self._answer_timeout_s = answer_timeout_s
         self._followup_budget = followup_budget
         self._spoken_max_chars = spoken_max_chars
         self._system_prompt = build_system_prompt(session.domain)
@@ -117,13 +139,20 @@ class LLMInterviewer:
     # ── turn helpers ────────────────────────────────────────────────────────
 
     async def _emit(self, event: dict[str, Any]) -> None:
-        """Push a UI event (turn transcript / final summary) to the optional
-        subscriber — the LiveKit worker publishes these as data packets."""
+        """Push a UI event (turn transcript / state / score / summary) to the
+        optional subscriber — the LiveKit worker publishes these as data
+        packets. Text mode has no subscriber: the events are no-ops."""
         if self._on_event is not None:
             try:
                 await self._on_event(event)
             except Exception:  # telemetry never breaks the interview
                 pass
+
+    async def _phase(self, phase: str) -> None:
+        """One ``state`` event: the page shows the phase's label as a spinner
+        until the next event (requirement: no silent background work)."""
+        await self._emit({"type": "state", "phase": phase,
+                          "label": PHASE_LABELS.get(phase, phase)})
 
     def _hop(self, stage: str, *, rag_ms: float = 0.0, **extra: Any) -> dict[str, Any]:
         """Snapshot one hop's latency: the last call's LLM metrics + the RAG
@@ -157,6 +186,7 @@ class LLMInterviewer:
         TTS — first audio after sentence one, truncated to the spoken budget.
         Text mode: stream to a string only."""
         self._interrupted = False
+        await self._phase("speaking")
         engine = self._voice_llm or self._llm
         messages = [{"role": "system", "content": self._system_prompt},
                     {"role": "user", "content": prompt}]
@@ -199,6 +229,27 @@ class LLMInterviewer:
         self._current_metrics = self._llm.metrics
         return result
 
+    async def _listen(self, question_id: str) -> CandidateAnswer:
+        """Wait for one spoken answer with a bounded wait — the no-hang gate
+        (RCA R1). First timeout: the interviewer asks the candidate to repeat
+        (one re-prompt per question). Second timeout: the question counts as
+        unanswered — the brain returns an empty answer, the judge evaluates
+        it, and the interview moves on. The FSM therefore can never deadlock
+        and always reaches ``wrap``."""
+        for attempt in (1, 2):
+            await self._phase("listening")
+            try:
+                return await self._candidate.answer(
+                    question_id, timeout_s=self._answer_timeout_s)
+            except TimeoutError:
+                if attempt == 2:
+                    return CandidateAnswer(text="")   # scored as unanswered
+                reprompt = await self._speak(build_reprompt_prompt())
+                self._session.turns.append(Turn("interviewer", reprompt))
+                await self._emit({"type": "turn", "role": "interviewer",
+                                  "text": reprompt, "stage": "reprompt"})
+        raise AssertionError("unreachable")  # pragma: no cover
+
     # ── the interview ───────────────────────────────────────────────────────
 
     async def run(self, doc_id: str,
@@ -208,6 +259,7 @@ class LLMInterviewer:
             candidate = ScriptedCandidate(answers)
         elif candidate is None or isinstance(candidate, dict):
             candidate = ScriptedCandidate(candidate)
+        self._candidate = candidate
         s = self._session
         hops: list[dict[str, Any]] = []
         rubric_retrievals = 0
@@ -236,17 +288,22 @@ class LLMInterviewer:
                               "text": spoken_question, "stage": "question"})
             hops.append(self._hop("question", question_id=ref.question_id))
 
-            answer = (await candidate.answer(ref.question_id))
+            answer = await self._listen(ref.question_id)
             self._last_stt_ms = answer.stt_ms
-            s.turns.append(Turn("candidate", answer.text))
-            await self._emit({"type": "turn", "role": "candidate",
-                              "text": answer.text})
+            if answer.text.strip():
+                # The candidate's words are appended to the transcript; in
+                # voice mode the page already showed them as ``candidate_heard``
+                # (STT-first echo), so empty (unanswered) turns add nothing.
+                s.turns.append(Turn("candidate", answer.text))
+                await self._emit({"type": "turn", "role": "candidate",
+                                  "text": answer.text})
             s.transition(InterviewerEvent.ANSWER_RECEIVED)       # -> EVALUATE
 
             followup_asked = False
             while True:
                 # Cache-gated rubric retrieval — repeated rubrics hit the
                 # RAG service's semantic cache (the Phase 1 gate metric).
+                await self._phase("evaluating")
                 rubric = await self._rag.agent_context(
                     "", "", rubric_query=ref.section_title)
                 rubric_retrievals += 1
@@ -278,16 +335,19 @@ class LLMInterviewer:
                                       "stage": "followup"})
                     hops.append(self._hop("followup", question_id=ref.question_id))
                     s.transition(InterviewerEvent.FOLLOWUP_ASKED)    # -> LISTEN
-                    followup_answer = await candidate.answer(f"{ref.question_id}:followup")
+                    followup_answer = await self._listen(
+                        f"{ref.question_id}:followup")
                     self._last_stt_ms = followup_answer.stt_ms
-                    s.turns.append(Turn("candidate", followup_answer.text))
-                    await self._emit({"type": "turn", "role": "candidate",
-                                      "text": followup_answer.text})
+                    if followup_answer.text.strip():
+                        s.turns.append(Turn("candidate", followup_answer.text))
+                        await self._emit({"type": "turn", "role": "candidate",
+                                          "text": followup_answer.text})
                     answer = followup_answer
                     s.transition(InterviewerEvent.ANSWER_RECEIVED)   # -> EVALUATE
                     continue    # judge the follow-up answer this round
                 break
 
+            await self._phase("scoring")
             s.scores.append({
                 "question_id": ref.question_id,
                 "section_title": ref.section_title,
@@ -296,6 +356,14 @@ class LLMInterviewer:
                 "followup_asked": followup_asked,
                 "raw_evaluation": evaluation.justifications[:500],
             })
+            # per-question score event: the page's scoreboard grows after
+            # every question, never only at the final summary (RCA R3).
+            await self._emit({"type": "score", "score": {
+                "question_id": ref.question_id,
+                "section_title": ref.section_title,
+                "scores": evaluation.scores,
+                "followup_asked": followup_asked,
+            }})
             s.transition(InterviewerEvent.NO_FOLLOWUP)               # -> SCORE
             s.transition(InterviewerEvent.SCORING_DONE)              # -> NEXT
 
@@ -314,6 +382,24 @@ class LLMInterviewer:
         llm_ft = [h["llm_first_token_ms"] for h in hops if h["llm_first_token_ms"]]
         llm_tot = [h["llm_total_ms"] for h in hops if h["llm_total_ms"]]
         rag_tot = [h["rag_total_ms"] for h in hops if h["rag_total_ms"]]
+        stats = {
+            "questions_asked": len(s.scores),
+            "rubric_retrievals": rubric_retrievals,
+            "rubric_cache_hits": rubric_cache_hits,
+            "cache_hit_rate": round(rubric_cache_hits / rubric_retrievals, 3)
+                              if rubric_retrievals else None,
+            "average_score": round(avg, 2),
+            "hops": hops,
+            "llm_first_token_mean_ms": round(sum(llm_ft) / len(llm_ft), 1)
+                                       if llm_ft else None,
+            "llm_total_mean_ms": round(sum(llm_tot) / len(llm_tot), 1)
+                                 if llm_tot else None,
+            "rag_total_mean_ms": round(sum(rag_tot) / len(rag_tot), 1)
+                                 if rag_tot else None,
+            "voice_budget": self._budget.aggregate() if self._budget else None,
+            "voice_budget_bar": self._budget.bar() if self._budget else None,
+            "wall_ms": round((time.perf_counter() - t_start) * 1000, 1),
+        }
         summary = {
             "session_id": s.session_id,
             "tenant_id": s.tenant_id,
@@ -322,24 +408,12 @@ class LLMInterviewer:
             "state": s.state.value,
             "turns": [t.__dict__ for t in s.turns],
             "scores": s.scores,
-            "stats": {
-                "questions_asked": len(s.scores),
-                "rubric_retrievals": rubric_retrievals,
-                "rubric_cache_hits": rubric_cache_hits,
-                "cache_hit_rate": round(rubric_cache_hits / rubric_retrievals, 3)
-                                  if rubric_retrievals else None,
-                "average_score": round(avg, 2),
-                "hops": hops,
-                "llm_first_token_mean_ms": round(sum(llm_ft) / len(llm_ft), 1)
-                                           if llm_ft else None,
-                "llm_total_mean_ms": round(sum(llm_tot) / len(llm_tot), 1)
-                                     if llm_tot else None,
-                "rag_total_mean_ms": round(sum(rag_tot) / len(rag_tot), 1)
-                                     if rag_tot else None,
-                "voice_budget": self._budget.aggregate() if self._budget else None,
-                "voice_budget_bar": self._budget.bar() if self._budget else None,
-                "wall_ms": round((time.perf_counter() - t_start) * 1000, 1),
-            },
+            "stats": stats,
         }
-        await self._emit({"type": "summary", "summary": summary})
+        await self._phase("wrap")
+        # Compact wire event: scores + stats only. The full-history summary
+        # stays the return value (persistence); the data packet stays small
+        # so it cannot overflow a live room channel (RCA R3).
+        await self._emit({"type": "summary", "summary": {
+            "state": s.state.value, "scores": s.scores, "stats": stats}})
         return summary

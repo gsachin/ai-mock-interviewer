@@ -5,22 +5,42 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>AI Mock Interviewer — Voice</title>
   <style>
-    :root { --bg:#0f1115; --panel:#171a21; --accent:#4f8cff; --ok:#2ecc71; --text:#e6e8ee; --dim:#8a90a0; }
+    :root { --bg:#0f1115; --panel:#171a21; --accent:#4f8cff; --ok:#2ecc71;
+            --warn:#e6b45c; --text:#e6e8ee; --dim:#8a90a0; }
     * { box-sizing: border-box; }
     body { font-family: system-ui, sans-serif; background: var(--bg); color: var(--text);
            max-width: 720px; margin: 0 auto; padding: 24px 16px 48px; }
     h1 { font-size: 22px; margin: 0 0 4px; }
-    .sub { color: var(--dim); font-size: 13px; margin-bottom: 20px; }
-    .setup { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; margin-bottom: 16px; }
+    .sub { color: var(--dim); font-size: 13px; margin-bottom: 16px; }
+    .chips { display: flex; gap: 10px; margin-bottom: 14px; min-height: 22px; }
+    .chip { font-size: 12.5px; color: var(--dim); background: var(--panel);
+            border: 1px solid #2a2f3a; border-radius: 20px; padding: 3px 12px;
+            font-variant-numeric: tabular-nums; }
+    .chip b { color: var(--text); }
+    .setup { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; margin-bottom: 12px; }
     select, button { font-size: 15px; padding: 10px 14px; border-radius: 8px; border: 1px solid #2a2f3a;
                      background: var(--panel); color: var(--text); cursor: pointer; }
     button.primary { background: var(--accent); border-color: var(--accent); color: #fff; font-weight: 600; }
     button:disabled { opacity: .45; cursor: default; }
     button.danger { background: #a33; border-color: #a33; color: #fff; }
-    #status { color: var(--dim); font-size: 14px; margin-bottom: 12px; min-height: 18px; }
+    #status { color: var(--dim); font-size: 14px; margin-bottom: 12px; min-height: 20px; }
     #status.live { color: var(--ok); }
-    #transcript { background: var(--panel); border-radius: 10px; padding: 14px; min-height: 220px;
-                  max-height: 46vh; overflow-y: auto; margin-bottom: 14px; }
+    #status.warn { color: var(--warn); }
+    /* Loader row: fixed min-height so the layout never jumps when the
+       spinner appears/disappears between turns (RCA 3.0.2). */
+    #loader { min-height: 34px; display: flex; align-items: center; gap: 10px;
+              margin-bottom: 10px; }
+    #loader .spin { width: 16px; height: 16px; border-radius: 50%;
+                    border: 3px solid #2a2f3a; border-top-color: var(--accent);
+                    animation: rot 0.9s linear infinite; flex: none; }
+    #loader.mic .spin { border-color: var(--ok); border-top-color: transparent;
+                        animation: pulse 1.1s ease-in-out infinite; }
+    #loaderLabel { font-size: 14px; }
+    #loader.hidden, .hidden { display: none; }
+    @keyframes rot { to { transform: rotate(360deg); } }
+    @keyframes pulse { 0%,100% { opacity:.4; transform: scale(.9); } 50% { opacity:1; transform: scale(1.15); } }
+    #transcript { background: var(--panel); border-radius: 10px; padding: 14px; min-height: 200px;
+                  max-height: 40vh; overflow-y: auto; margin-bottom: 14px; }
     .msg { margin: 0 0 10px; line-height: 1.45; }
     .msg .who { font-size: 12px; font-weight: 600; letter-spacing: .4px; }
     .msg.interviewer .who { color: var(--accent); }
@@ -31,11 +51,18 @@
     #scores table { width: 100%; border-collapse: collapse; font-size: 13px; }
     #scores th, #scores td { text-align: left; padding: 5px 8px; border-bottom: 1px solid #232834; }
     .stats { color: var(--dim); font-size: 13px; margin-top: 10px; }
+    #banner { background: #12301f; border: 1px solid #1f4d31; color: var(--ok);
+              border-radius: 10px; padding: 12px 14px; margin-bottom: 14px; font-size: 14px; }
   </style>
 </head>
 <body>
   <h1>🎤 AI Mock Interviewer</h1>
-  <div class="sub">Voice interview — the interviewer speaks, you answer, it scores. All audio runs through a local LiveKit room.</div>
+  <div class="sub">Voice interview — the interviewer speaks, you answer aloud, it scores. All audio runs through a local LiveKit room.</div>
+
+  <div class="chips">
+    <span class="chip" id="qchip">Question —</span>
+    <span class="chip" id="timer">⏱ 0:00</span>
+  </div>
 
   <div class="setup">
     <label for="domain">Domain</label>
@@ -50,20 +77,50 @@
   </div>
 
   <div id="status">Idle — pick a domain and start. Your microphone will be requested.</div>
+  <div id="loader" class="hidden"><span class="spin"></span><span id="loaderLabel"></span></div>
   <div id="transcript"></div>
-  <div id="scores" hidden></div>
+  <div id="scores" hidden>
+    <h2>Scoreboard</h2>
+    <table><thead><tr><th>Question</th><th>Section</th><th>Scores (cor/dep/com)</th><th>Follow-up</th></tr></thead>
+    <tbody id="scoreRows"></tbody></table>
+    <div class="stats" id="scoreStats">—</div>
+  </div>
+  <div id="banner" hidden></div>
 
   <script src="https://cdn.jsdelivr.net/npm/livekit-client@2/dist/livekit-client.umd.min.js"></script>
   <script>
     const $ = (id) => document.getElementById(id);
     const statusEl = $("status"), transcriptEl = $("transcript"), scoresEl = $("scores");
-    const startBtn = $("start"), hangupBtn = $("hangup");
-    let room = null;
+    const scoreRowsEl = $("scoreRows"), scoreStatsEl = $("scoreStats");
+    const startBtn = $("start"), hangupBtn = $("hangup"), bannerEl = $("banner");
+    const loaderEl = $("loader"), loaderLabelEl = $("loaderLabel");
+    const qChipEl = $("qchip"), timerEl = $("timer");
+    const DOMAINS = ["system-design", "ios", "dsa", "devops"];
 
-    function setStatus(text, live) {
+    let room = null;
+    let questionIndex = 0, questionTotal = 0;
+    let scoreEntries = [];          // {question_id, section_title, scores, followup_asked}
+    let timerHandle = null, sessionStartTs = 0;
+    let endedFlag = false, interviewerHeard = false;
+
+    function setStatus(text, cls) {
       statusEl.textContent = text;
-      statusEl.classList.toggle("live", !!live);
+      statusEl.classList.remove("live", "warn");
+      if (cls) statusEl.classList.add(cls);
     }
+
+    function setLoader(phase, label) {
+      if (phase === "speaking") { hideLoader(); return; }   // audio is playing
+      loaderEl.classList.remove("mic");
+      if (phase === "listening") loaderEl.classList.add("mic");
+      loaderEl.classList.remove("hidden");
+      loaderLabelEl.textContent = label || "";
+      // First-listen hint: tell the student their words will echo below.
+      if (phase === "listening" && !transcriptEl.children.length)
+        setStatus("Speak now — say your answer aloud. It will appear below as text.", "live");
+    }
+
+    function hideLoader() { loaderEl.classList.add("hidden"); }
 
     function addMessage(role, text) {
       const div = document.createElement("div");
@@ -75,36 +132,145 @@
       transcriptEl.scrollTop = transcriptEl.scrollHeight;
     }
 
-    function renderScores(summary) {
-      const s = summary.stats || {};
-      const rows = (summary.scores || []).map(e => `
-        <tr><td>${e.question_id}</td><td>${e.section_title || ""}</td>
-            <td>${Object.entries(e.scores).map(([k, v]) => k.slice(0, 3) + " " + v).join(" · ")}</td>
-            <td>${e.followup_asked ? "yes" : "no"}</td></tr>`).join("");
-      scoresEl.innerHTML = `
-        <h2>Interview complete</h2>
-        <table><tr><th>Question</th><th>Section</th><th>Scores (cor/dep/com)</th><th>Follow-up</th></tr>${rows}</table>
-        <div class="stats">
-          Average score: <b>${s.average_score ?? "–"} / 5</b> ·
-          Rubric cache hit rate: <b>${s.cache_hit_rate ?? "–"}</b> ·
-          Wall: <b>${s.wall_ms ?? "–"} ms</b><br>
-          Voice budget: <b>${s.voice_budget_bar || "–"}</b>
-        </div>`;
-      scoresEl.hidden = false;
+    function formatTime(ms) {
+      const s = Math.floor(ms / 1000);
+      return Math.floor(s / 60) + ":" + String(s % 60).padStart(2, "0");
     }
 
+    function startTimer() {
+      stopTimer();
+      sessionStartTs = Date.now();
+      timerEl.textContent = "⏱ 0:00";
+      timerHandle = setInterval(() => {
+        timerEl.textContent = "⏱ " + formatTime(Date.now() - sessionStartTs);
+      }, 1000);
+    }
+    function stopTimer() { if (timerHandle) { clearInterval(timerHandle); timerHandle = null; } }
+
+    function setQ(n) {
+      questionIndex = n;
+      qChipEl.innerHTML = questionTotal
+        ? `Question <b>${n}</b> of <b>${questionTotal}</b>`
+        : `Question <b>${n}</b>`;
+    }
+
+    function scoreAvg() {
+      const all = [];
+      for (const e of scoreEntries) all.push(...Object.values(e.scores || {}));
+      return all.length ? (all.reduce((a, b) => a + b, 0) / all.length).toFixed(2) : null;
+    }
+
+    function renderScoreboard() {
+      scoreRowsEl.innerHTML = scoreEntries.map((e, i) => `
+        <tr><td>Q${i + 1}</td><td>${e.section_title || ""}</td>
+            <td>${Object.entries(e.scores || {}).map(([k, v]) => k.slice(0, 3) + " " + v).join(" · ")}</td>
+            <td>${e.followup_asked ? "yes" : "no"}</td></tr>`).join("");
+      scoresEl.hidden = false;
+      const avg = scoreAvg();
+      scoreStatsEl.textContent = avg !== null
+        ? `Average so far: <b>${avg}</b> / 5` : "—";
+    }
+
+    function addScore(entry) {
+      scoreEntries.push(entry);
+      renderScoreboard();
+      setStatus("Score recorded — the next question is coming.", "live");
+    }
+
+    function showBanner(text) {
+      bannerEl.textContent = text;
+      bannerEl.hidden = false;
+    }
+
+    function endStateUI(reason) {
+      endedFlag = true;
+      stopTimer();
+      hideLoader();
+      showBanner("✅ " + (reason || "Interview complete — thank you for practicing!"));
+      setStatus("Session over — you can start a new interview.", "live");
+      // The agent has left the room; drop the connection so a fresh Start works.
+      setTimeout(() => { if (room) room.disconnect(); }, 1500);
+    }
+
+    function resetUI() {
+      endedFlag = false;
+      interviewerHeard = false;
+      questionIndex = 0; questionTotal = 0;
+      scoreEntries = [];
+      qChipEl.innerHTML = "Question —";
+      timerEl.textContent = "⏱ 0:00";
+      transcriptEl.innerHTML = "";
+      bannerEl.hidden = true;
+      scoresEl.hidden = true;
+      scoreRowsEl.innerHTML = "";
+      scoreStatsEl.textContent = "—";
+      hideLoader();
+    }
+
+    // ── typed event protocol (RCA 3.1): state | turn | candidate_heard |
+    //    score | summary | ended — every event appends text or sets a loader.
     function onData(payload, participant, kind, topic) {
-      if (topic !== "interview") return;
       let event;
       try { event = JSON.parse(new TextDecoder().decode(payload)); }
-      catch { return; }
-      if (event.type === "turn" && event.text) addMessage(event.role, event.text);
-      else if (event.type === "summary") { addMessage("interviewer", "— Interview over. Thanks for practicing! —"); renderScores(event.summary); }
+      catch { return; }                       // not our JSON — ignore
+      switch (event.type) {
+        case "state":
+          setLoader(event.phase, event.label);
+          break;
+        case "turn":
+          if (event.text) addMessage(event.role === "candidate" ? "candidate" : "interviewer", event.text);
+          if (event.stage === "question") setQ(questionIndex + 1);
+          hideLoader();                        // spoken turn's text just arrived
+          break;
+        case "candidate_heard":
+          addMessage("candidate", event.text); // your words, echoed instantly
+          break;
+        case "score":
+          addScore(event.score);
+          break;
+        case "summary": {
+          hideLoader();
+          const s = event.summary || {};
+          const stats = s.stats || {};
+          scoreEntries = (s.scores || scoreEntries);
+          renderScoreboard();
+          const cache = stats.cache_hit_rate === null || stats.cache_hit_rate === undefined
+            ? "–" : stats.cache_hit_rate;
+          scoreStatsEl.innerHTML =
+            `Average score: <b>${stats.average_score ?? "–"} / 5</b> · ` +
+            `Rubric cache hit rate: <b>${cache}</b> · Wall: <b>${stats.wall_ms ?? "–"} ms</b><br>` +
+            `Voice budget: <b>${stats.voice_budget_bar || "–"}</b>`;
+          setStatus("Interview over — the interviewer is wrapping up.", "live");
+          break;
+        }
+        case "ended":
+          endStateUI(event.reason);
+          break;
+        default:
+          console.log("unknown voice event type:", event.type, event);
+      }
+    }
+
+    // ── connection ─────────────────────────────────────────────────────────
+    async function enableMic() {
+      // Explicit acoustic processing: in a speakers + mic setup the
+      // interviewer's own TTS must not become a "candidate answer" (RCA R1).
+      try {
+        if (LivekitClient.createLocalAudioTrack) {
+          const track = await LivekitClient.createLocalAudioTrack({
+            echoCancellation: true, noiseSuppression: true, autoGainControl: true,
+          });
+          await room.localParticipant.publishTrack(track);
+          return;
+        }
+      } catch (e) { console.warn("constrained mic failed, retrying defaults", e); }
+      await room.localParticipant.setMicrophoneEnabled(true);
     }
 
     startBtn.addEventListener("click", async () => {
       startBtn.disabled = true;
       setStatus("Requesting room token…");
+      resetUI();
       try {
         const resp = await fetch("/voice/token", {
           method: "POST",
@@ -112,11 +278,14 @@
           body: JSON.stringify({ domain: $("domain").value }),
         });
         if (!resp.ok) throw new Error("token request failed: " + resp.status);
-        const { livekit_url, token } = await resp.json();
+        const body = await resp.json();
+        questionTotal = body.max_questions || 0;
+        setQ(0);
 
         room = new LivekitClient.Room();
         room.on(LivekitClient.RoomEvent.TrackSubscribed, (track) => {
           if (track.kind === LivekitClient.Track.Kind.Audio) {
+            interviewerHeard = true;
             const el = track.attach();
             el.autoplay = true;
             document.body.appendChild(el);
@@ -124,27 +293,51 @@
         });
         room.on(LivekitClient.RoomEvent.DataReceived, onData);
         room.on(LivekitClient.RoomEvent.Disconnected, () => {
-          setStatus("Disconnected.");
-          transcriptEl.scrollTop = transcriptEl.scrollHeight;
-          startBtn.disabled = false;
-          hangupBtn.hidden = true;
+          stopTimer();
+          hideLoader();
           room = null;
+          hangupBtn.hidden = true;
+          startBtn.disabled = false;
+          setStatus(endedFlag
+            ? "Session over — pick a domain and start another interview."
+            : "Disconnected — pick a domain and start again.");
         });
 
-        await room.connect(livekit_url, token);
-        setStatus("Connected — enabling microphone…", true);
-        await room.localParticipant.setMicrophoneEnabled(true);
-        setStatus("Interview live. The interviewer will greet you — answer aloud, and you can interrupt it anytime.", true);
-        transcriptEl.innerHTML = "";
-        scoresEl.hidden = true;
+        await room.connect(body.livekit_url, body.token);
+        // End call is available from the moment we are connected (before the
+        // mic step) — a mic failure must never strand the user in a room
+        // with no way out (RCA R6).
         hangupBtn.hidden = false;
+        hangupBtn.disabled = false;
+        setStatus("Connected — enabling microphone…", "live");
+        startTimer();
+        await enableMic();
+        setStatus("Interview live. The interviewer will greet you — answer aloud; " +
+                  "your words appear below as text, and you can interrupt anytime.", "live");
+
+        // Dev-server caveat: a worker idled out by livekit --dev never joins.
+        setTimeout(() => {
+          if (room && !interviewerHeard) {
+            setStatus("Hmm — no interviewer audio yet. If this lasts, the dev " +
+                      "worker may have idled: re-run start_services.ps1 -WithVoice.", "warn");
+          }
+        }, 10000);
       } catch (e) {
-        setStatus("Error: " + e.message);
+        setStatus("Error: " + (e && e.message ? e.message : e));
+        if (room) room.disconnect();          // never leave a dangling room
         startBtn.disabled = false;
       }
     });
 
-    hangupBtn.addEventListener("click", () => { if (room) room.disconnect(); });
+    hangupBtn.addEventListener("click", () => {
+      const r = room;
+      room = null;                             // idempotent + guarded
+      hangupBtn.disabled = true;
+      endedFlag = false;
+      if (!r) { startBtn.disabled = false; return; }
+      try { r.localParticipant.setMicrophoneEnabled(false); } catch (e) {}
+      try { r.disconnect(); } catch (e) {}
+    });
   </script>
 </body>
 </html>

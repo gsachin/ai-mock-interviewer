@@ -70,6 +70,17 @@ def build_followup_prompt(followup: str) -> str:
     return FOLLOWUP_PROMPT.format(followup=followup)
 
 
+REPROMPT_PROMPT = (
+    "The candidate did not answer within the time limit. Say exactly one "
+    "short, friendly sentence asking them to repeat their answer now. "
+    "No markdown."
+)
+
+
+def build_reprompt_prompt() -> str:
+    return REPROMPT_PROMPT
+
+
 WRAP_PROMPT = (
     "The interview is over. Give one short spoken closing sentence and state "
     "the average score out of 5 ({avg}). No markdown."

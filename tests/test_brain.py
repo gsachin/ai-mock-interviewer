@@ -110,3 +110,107 @@ def test_empty_followup_answer_does_not_crash():
     # the empty follow-up answer produced no followup retrieval call
     assert all("Silent" not in c[0] for c in rag.followup_calls if c[0])
     assert not any(c[0] == "" for c in rag.followup_calls)
+
+
+# ── RCA fix regression tests (2026-09-03) ─────────────────────────────────────
+# T1/T4: three-question sessions + the typed page protocol (state phases,
+# per-question score events, compact summary). T2: the bounded answer wait
+# with one re-prompt and an unanswered-score fallback.
+
+EVAL_NONE = ("Correctness: 4 - covers the core mechanism.\n"
+             "Depth: 4 - solid trade-offs.\n"
+             "Communication: 4 - clear.\n"
+             "FOLLOW_UP: none")
+
+
+def test_event_protocol_phases_scores_and_compact_summary():
+    """T4: every phase emits a labelled state event; scores arrive per
+    question; the summary data packet carries scores+stats only (no full
+    transcript — it cannot overflow the room channel)."""
+    rag = StubRag(["Rate limiter", "Consistent hashing", "Caching"])
+    llm = StubLLM(
+        ["Welcome to your system design interview.",      # greeting
+         "Design a rate limiter for a public API.",       # q1
+         "Explain consistent hashing.",                   # q2
+         "Design a cache for hot keys.",                  # q3
+         "Closing remarks. Your average score was 4.0."], # wrap
+        [EVAL_NONE, EVAL_NONE, EVAL_NONE])
+    events: list[dict] = []
+
+    async def collect(ev: dict) -> None:
+        events.append(ev)
+
+    interviewer = LLMInterviewer(
+        rag, llm, Session(session_id="proto", tenant_id="default",
+                          domain="system-design"),
+        max_questions=3, on_event=collect)
+    summary = run(interviewer.run("bank-sd", answers={
+        "s1": "token bucket with redis counters",
+        "s2": "virtual nodes minimize reshuffling",
+        "s3": "a write-through cache with an LRU eviction list",
+    }))
+
+    assert summary["stats"]["questions_asked"] == 3
+    states = [e for e in events if e["type"] == "state"]
+    # every state event carries a visible processing label (3.0.2)
+    assert all(e.get("label") for e in states)
+    phases = [e["phase"] for e in states]
+    assert phases.count("listening") == 3
+    assert phases.count("evaluating") == 3
+    assert phases.count("scoring") == 3
+    # per-question scores arrive progressively, in question order
+    scores = [e for e in events if e["type"] == "score"]
+    assert [e["score"]["question_id"] for e in scores] == ["s1", "s2", "s3"]
+    assert all(set(e["score"]) >= {"question_id", "section_title", "scores",
+                                   "followup_asked"} for e in scores)
+    # non-empty spoken answers still produce candidate turn events
+    cand_turns = [e for e in events
+                  if e["type"] == "turn" and e["role"] == "candidate"]
+    assert len(cand_turns) == 3
+    # exactly one summary packet, compact: {state, scores, stats}, no turns
+    summaries = [e for e in events if e["type"] == "summary"]
+    assert len(summaries) == 1
+    assert set(summaries[0]["summary"]) == {"state", "scores", "stats"}
+    assert summaries[0]["summary"]["state"] == "wrap"
+    assert summaries[0]["summary"]["stats"]["questions_asked"] == 3
+
+
+def test_answer_timeout_reprompts_once_then_moves_on():
+    """T2: a candidate that never speaks must not hang the interview — one
+    spoken re-prompt per question, then the question is scored as unanswered
+    (empty answer) and the FSM reaches wrap."""
+    from interviewer.voice.livekit import LiveKitCandidate
+
+    rag = StubRag(["Rate limiter", "Consistent hashing"])
+    llm = StubLLM(
+        ["Welcome to your system design interview.",      # greeting
+         "Design a rate limiter for a public API.",       # q1
+         "Sorry, I did not catch that. Could you repeat?",  # re-prompt q1
+         "Explain consistent hashing.",                   # q2
+         "Sorry, I did not catch that. Could you repeat?",  # re-prompt q2
+         "Closing remarks. Your average score was 2.0."],  # wrap
+        [EVAL_NONE, EVAL_NONE])
+    events: list[dict] = []
+
+    async def collect(ev: dict) -> None:
+        events.append(ev)
+
+    interviewer = LLMInterviewer(
+        rag, llm, Session(session_id="silent", tenant_id="default",
+                          domain="system-design"),
+        answer_timeout_s=0.05, on_event=collect)
+    summary = run(interviewer.run("bank-sd", candidate=LiveKitCandidate()))
+
+    # no deadlock: wrap reached, every question scored (as unanswered)
+    assert summary["state"] == InterviewerState.WRAP.value
+    assert len(summary["scores"]) == 2
+    assert summary["stats"]["wall_ms"] < 30_000
+    # one re-prompt per question, spoken and shown in the transcript
+    reprompts = [e for e in events
+                 if e["type"] == "turn" and e.get("stage") == "reprompt"]
+    assert len(reprompts) == 2
+    # silence produced no candidate turns
+    assert not any(e.get("role") == "candidate" for e in events)
+    # unanswered questions went through the judge (evaluating phases exist)
+    phases = [e["phase"] for e in events if e["type"] == "state"]
+    assert phases.count("evaluating") == 2

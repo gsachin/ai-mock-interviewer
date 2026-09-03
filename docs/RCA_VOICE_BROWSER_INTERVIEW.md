@@ -8,6 +8,41 @@ verified runs.
 
 ---
 
+## ⏱ Implementation status (2026-09-03) — fix plan T1–T8: DONE
+
+The §4 fix plan below has been fully implemented and verified. The analysis and
+design remain the reference for *why*; `docs/DONE_AND_PENDING.md` tracks overall
+project state.
+
+| Task | Status | Where |
+|---|---|---|
+| T1 — 3 questions (`INTERVIEW_MAX_QUESTIONS`, default 3) | ✅ | `interviewer/config.py`, `voice/interviewer.py`, `brain.py`, `interviewer/server.py` (token `max_questions`) |
+| T2 — bounded `answer()` + re-prompt + unanswered fallback | ✅ | `interviewer/voice/livekit.py`, `brain.py` (`_listen`), `interviewer/prompts.py` |
+| T3 — STT-first echo (`candidate_heard` + `state: transcribing`) | ✅ | `interviewer/voice/agent.py` |
+| T4 — `state {phase,label}` + per-question `score` + compact `summary` | ✅ | `interviewer/brain.py` |
+| T5 — page UX (loader, tolerant `onData`, AEC mic, End always) | ✅ | `web/index.html` (also 7.4 chips) |
+| T6 — echo gate in the VAD consumer | ✅ | `EchoGate` in `interviewer/voice/livekit.py`, wired in `agent.py` |
+| T7 — `ended` event + UI end-state + judge-model config | ✅ | `interviewer/voice/agent.py`, `web/index.html`, `config.py` |
+| T8 — regression tests + verification | ✅ | 64 unit tests (was 50); no-mic E2E PASS — state=wrap, **3 questions scored**, progressive `score` events, `candidate_heard` echoes, `ended` received (~2:45 wall on the all-CPU stack) |
+
+**Verification evidence (2026-09-03):** `.venv\Scripts\python.exe -m pytest tests/ -m "not live"` → 64 passed;
+`scripts/e2e_voice_client.py --answers 6` against the launcher stack → E2E PASSED;
+page served HTTP 200, inline JS passes `node --check`.
+
+**Still outstanding:**
+1. **Manual browser + mic check** (§5 checklist, owner: the user — see P-A in
+   DONE_AND_PENDING.md): transcript echo ~1 s after speaking, loader visible
+   during every backend phase, progressive scoreboard, End from every state.
+2. §7 improvement suggestions 7.1–7.3 / 7.5–7.7 / 7.9 and P1–P7 of
+   DONE_AND_PENDING.md (latency, watchdog, Redis gate, persistence, hardening,
+   quality loop, repo housekeeping) — not started.
+
+**Decision-log deltas (from §6):** none — defaults implemented as decided
+(3 questions, qwen2.5:14b judge with `INTERVIEW_JUDGE_MODEL` override added,
+compact summary transport, page-side AEC + agent-side gate).
+
+---
+
 ## 1. Symptom map (what the user reported → what it means)
 
 | # | Reported symptom | Meaning in the system |

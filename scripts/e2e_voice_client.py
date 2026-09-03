@@ -62,6 +62,7 @@ class CandidateClient:
         except asyncio.TimeoutError:
             print("[client] TIMEOUT — no summary received")
         finally:
+            await asyncio.sleep(1.0)  # grace: let the worker's `ended` land
             await self._room.disconnect()
         if self.summary is None:
             raise RuntimeError("no summary received from the interviewer")
@@ -88,9 +89,18 @@ class CandidateClient:
         if event.get("type") == "turn":
             print(f"[client] turn: {event['role']}: {event['text'][:90]!r}")
             self._events.append(event)
+        elif event.get("type") == "candidate_heard":
+            print(f"[client] heard me: {event['text'][:60]!r}")
+        elif event.get("type") == "score":
+            print(f"[client] score: {event['score']['question_id']} "
+                  f"{event['score']['scores']}")
         elif event.get("type") == "summary":
-            self.summary = event["summary"]
+            self.summary = event["summary"]   # compact: {state, scores, stats}
             print("[client] SUMMARY received — interview complete")
+            self._done.set()
+        elif event.get("type") == "ended":
+            self.ended = event
+            print(f"[client] ENDED: {event.get('reason', '')}")
             self._done.set()
 
     def _new_turn_stage(self, seen: int) -> str | None:
@@ -180,12 +190,16 @@ async def main() -> None:
     summary = await client.run()
 
     stats = summary["stats"]
+    interviewer_turns = [e for e in client._events
+                         if e.get("role") == "interviewer"]
     bar = (stats["voice_budget_bar"] or "").replace("→", "->") \
         .replace("✓", "OK").replace("✗", "FAIL")
     print("\n=== E2E RESULT ===")
     print(f"state: {summary['state']}  questions: {stats['questions_asked']}")
-    print(f"turns: {len(summary['turns'])}  scores: {len(summary['scores'])}")
+    print(f"interviewer turns: {len(interviewer_turns)}  "
+          f"scores: {len(summary['scores'])}")
     print(f"interviewer audio frames received: {client._interviewer_frames}")
+    print(f"ended event: {getattr(client, 'ended', None) is not None}")
     print(f"voice budget: {bar}")
     print(f"cache hit rate: {stats['cache_hit_rate']}  "
           f"wall: {stats['wall_ms']} ms  total: {time.perf_counter() - t0:.0f} s")
@@ -198,6 +212,7 @@ async def main() -> None:
     assert stats["questions_asked"] >= 1, "no questions asked"
     assert summary["scores"], "no scores produced"
     assert "voice_budget_bar" in stats
+    assert getattr(client, "ended", None) is not None, "no ended event"
     print("\nE2E PASSED (state=wrap, scores=%d)" % len(summary["scores"]))
 
 

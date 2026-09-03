@@ -34,3 +34,23 @@ def test_voice_defaults_and_overrides():
     })
     assert cfg2.tts_provider == "elevenlabs"
     assert cfg2.tts_voice_id == "voice_9BWqMINAzXWkHeueBiaj"
+
+
+def test_voice_session_shape_defaults():
+    """T1: three questions per session, a 60 s answer budget, and no judge
+    override unless configured."""
+    cfg = InterviewerConfig.from_env(environ={})
+    assert cfg.max_questions == 3
+    assert cfg.answer_timeout_s == 60.0
+    assert cfg.judge_model is None
+
+
+def test_voice_session_shape_env_overrides():
+    cfg = InterviewerConfig.from_env({
+        "INTERVIEW_MAX_QUESTIONS": "5",
+        "INTERVIEW_ANSWER_TIMEOUT_S": "45.5",
+        "INTERVIEW_JUDGE_MODEL": "qwen2.5:3b",
+    })
+    assert cfg.max_questions == 5
+    assert cfg.answer_timeout_s == 45.5
+    assert cfg.judge_model == "qwen2.5:3b"

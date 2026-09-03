@@ -1,96 +1,114 @@
 # DONE & PENDING — ai-mock-interviewer (voice phase)
 
-**Date:** 2026-09-02 · **Status:** Phase 3 voice interview **implemented + verified end-to-end**
-**Read also:** `docs/STATUS.md` (launch + numbers) · `docs/PLAN_VOICE_PHASE3_BROWSER.md` (original gap analysis, now superseded)
+**Date:** 2026-09-03 · **Status:** RCA browser fixes (T1–T8) **implemented + verified**;
+manual browser-with-mic check still **pending** (owner: user, after app testing)
+**Read also:** `docs/STATUS.md` (launch + numbers) · `docs/RCA_VOICE_BROWSER_INTERVIEW.md`
+(fix plan — all T tasks now DONE per §8 status block)
 
 ---
 
 ## 1. ✅ DONE — implemented and verified
 
-### Text interview (Phases 1–2, previously verified)
-- Scripted interview over the enterprise-rag-core MCP service; LLM interviewer
-  (qwen2.5:14b via Ollama) with judge scoring, follow-ups, session persistence.
-- One-shot launcher `start_services.ps1` (RAG :8031, backend :8010, Streamlit :8501);
-  Streamlit chat UI.
+### Foundations (Phases 1–3, verified previously)
+- Scripted + LLM text interviews over the enterprise-rag-core MCP service (Phases 1–2).
+- Phase 3 voice pipeline verified end-to-end with the *scripted Python client*
+  (worker, VAD/STT/TTS, Kokoro + faster-whisper CPU, LiveKit `--dev`, launcher `-WithVoice`).
 
-### Voice interview in the browser (Phase 3) — NEW 2026-09-02
-Full spoken pipeline, **verified with 3 complete end-to-end interviews** on the
-launcher-started stack (each `state=wrap`, 2 questions scored, interviewer
-audio received, summary delivered):
+### RCA browser fixes — NEW 2026-09-03 (the reported stall/no-transcript/no-rating/End-call bugs)
+Implemented per `docs/RCA_VOICE_BROWSER_INTERVIEW.md` §4; **64 unit tests green**
+(was 50) + **live E2E PASS** (3 questions scored, per-question `score` events,
+`candidate_heard` echoes, `ended` received, `state=wrap`, ~2:45 wall):
 
-| Component | Implementation | Verified |
+| # | Task | Implementation |
 |---|---|---|
-| Browser voice UI (domain picker → start → speak; live transcript + scores; served by FastAPI, no CORS) | `web/index.html` | ✅ 3× E2E |
-| Token endpoint `POST /voice/token` (LiveKit JWT, room `interview-<domain>-<sid>`, agent dispatch) | `interviewer/server.py` | ✅ |
-| Agent worker: room audio → silero VAD → STT → `LLMInterviewer` → sentence TTS → room playback; barge-in on speech | `interviewer/voice/agent.py` | ✅ |
-| Worker entry point `python -m interviewer.voice.worker` (fail-fast real engines, always-accept, refusal logging) | `interviewer/voice/worker.py` | ✅ |
-| Event-driven candidate (queue, stale-interjection clear) + LiveKit audio sink (20 ms frames, interrupt) | `interviewer/voice/livekit.py` | ✅ |
-| Audio format normalization to 48 kHz mono s16le (f32le / wav / mp3) | `interviewer/voice/audio_format.py` | ✅ unit |
-| **Kokoro TTS** wired (self-hosted ONNX, ~110 MB auto-download, high-quality preset `af_heart`) | `interviewer/voice/tts.py` | ✅ synth smoke |
-| **faster-whisper STT** default; CUDA→CPU int8 auto-fallback (this machine lacks cuDNN/cuBLAS) | `interviewer/voice/stt.py` | ✅ transcribe smoke |
-| `AudioSink` protocol + staged UI events (`stage: greeting/question/followup/wrap`) in the brain | `interviewer/brain.py` | ✅ unit |
-| LiveKit infra: `livekit-server --dev` :7880 (binary in `.tools/`, git-ignored); `llama3.2:3b` pulled for the hot path | launcher | ✅ |
-| Launcher `-WithVoice` (livekit :7880 + worker, kill-stale incl. worker, readiness probes, logs, summary) | `start_services.ps1` | ✅ boot |
-| No-mic E2E harness (scripted Kokoro answers into the room) | `scripts/e2e_voice_client.py` | ✅ 3× pass |
-| Unit tests (19 voice-pipeline tests incl. token endpoint, sink, candidate, formats, resolutions) | `tests/test_voice_pipeline.py` | ✅ 50/50 suite |
+| T1 | 3 questions/session | `config.py`: `INTERVIEW_MAX_QUESTIONS` (default **3**) → `voice/interviewer.py` → `brain.py`; token response carries `max_questions` |
+| T2 | No-hang answers | bounded `answer(timeout_s)` (`voice/livekit.py`), `INTERVIEW_ANSWER_TIMEOUT_S` (60 s), one spoken re-prompt then scored-as-unanswered (`brain._listen`); candidates accept `timeout_s` |
+| T3 | STT-first echo | worker emits `state: transcribing` + `candidate_heard {text}` the instant STT returns; brain candidate-role turns filtered (`is_page_event`) so no transcript duplicates |
+| T4 | Phase/label protocol | `state {phase,label}` on every transition, per-question `score` events, compact `summary` packet (`{state, scores, stats}`, no full transcript) |
+| T5 | Page UX | `web/index.html`: loader never absent (mic-pulse listening / spinner labels), tolerant `onData`, progressive scoreboard, explicit mic AEC constraints, End call from connect onward, end-states, "Question n of Y" + elapsed chips |
+| T6 | Echo gate | pure `EchoGate` (`voice/livekit.py`) — no self-barge-in during playback, echo-tail utterances dropped; sink exposes `playing`/`last_stop_ts` |
+| T7 | `ended` event + end-state | worker publishes `ended {reason}` on job end; page renders end-state + auto-disconnect for a fresh Start; `INTERVIEW_JUDGE_MODEL` override config |
+| T8 | Regression tests | +14 tests (protocol ordering, timeout path w/ real `LiveKitCandidate`, EchoGate decisions, sink state, factory wiring, config envs) — 64 passed |
 
-### Machine-specific problems solved
-- **Windows Smart App Control** blocks PyAV ≥ 13 unsigned DLLs → `[voice]` pins
-  `av==12.3.0` (verified importable).
-- **cuDNN/cuBLAS missing** for faster-whisper GPU → automatic CPU int8 fallback.
-- **livekit-agents 1.7 API drift** handled: `push_frame` is fire-and-forget
-  (VAD events come from iterating the stream); `VADEvent.frames` carries the
-  speech buffer; `run_app` accepts `AgentServer`; legacy CLI needs a
-  subcommand; CPU-load gate must be `inf` (a busy dev machine otherwise marks
-  the worker unavailable).
+### Verified 2026-09-03
+- `.venv\Scripts\python.exe -m pytest tests/ -m "not live"` → **64 passed, 5 deselected**.
+- No-mic E2E (`scripts/e2e_voice_client.py --answers 6`) on the launcher stack →
+  **PASSED**: state=wrap, questions=3, 3 progressive scores, every answer echoed
+  (`heard me: …`), `ended` event received, interviewer audio frames > 0.
+- Page served (HTTP 200) and inline JS passes `node --check`.
 
 ---
 
 ## 2. ⏳ PENDING — for future work (prioritized)
 
-### P1. Real-engine latency < 1.5 s round-trip  *(biggest quality gap)*
-Measured on all-CPU engines: STT ~1.0 s, RAG ~0.2–0.36 s, LLM first token
-~0.28–0.8 s, **TTS first audio ~3.6 s** → total ~6.5–8.4 s vs the 1.5 s gate
-(`voice_budget_bar` reports it per interview). Levers:
-- GPU STT on the RTX 5060 Ti (install cuDNN/cuBLAS 12) or `tiny.en` model.
-- Kokoro int8 model + shorter first sentences; or cloud TTS (Cartesia key —
-  the engine is already implemented in `tts.py`).
-- Deepgram STT is implemented but untested live (needs a key).
+### P-A. Manual browser verification (NEXT — owner: user, after app testing)
+The RCA §5 browser checklist cannot be automated here: speak an answer and confirm
+your words appear as text within ~1 s; a loader + label is visible during every
+backend phase (watch the 30–60 s judge window); the scoreboard grows after each
+question; End call works from every state; 3 questions per session.
+Stack state at last boot: running (see §3 to restart).
 
-### P2. Worker watchdog for the dev server idle-drop
-`livekit-server --dev` drops a worker that idles ~20 s and it does not
-reliably re-register → start the interview promptly after `-WithVoice`;
-re-run the launcher between sessions. Future: a supervisor that restarts the
-worker when a dispatch probe fails, or a production LiveKit server.
+### P-B. RCA §7 improvement suggestions (architect review — all still pending)
+| # | Suggestion | Status |
+|---|---|---|
+| 7.1 | Preload STT/TTS models before the greeting (first utterance pays the model load) | ❌ pending |
+| 7.2 | Breadth-first question sampling across bank sections (today: sequential top-of-bank → same 3 questions cluster / repeat) | ❌ pending |
+| 7.3 | Adaptive judge (switch to the warm hot-path LLM after 2 slow judge rounds) | ❌ pending |
+| 7.4 | "Question n of Y" + elapsed chip in the page header | ✅ done (in T5) |
+| 7.5 | Let the student correct a mis-transcription once per answer | ❌ pending |
+| 7.6 | Persist each scored question to the management plane as it happens | ❌ pending (= P4) |
+| 7.7 | Guard the follow-up cadence (cap drilling on strong answers) | ❌ pending |
+| 7.8 | "Retry interview" / "different domain" one-click affordance | ◑ partial — Start-again works after `ended`; fresh per-session question selection awaits 7.2 |
+| 7.9 | Instrument the abandonment funnel (worker log milestones) | ❌ pending |
+
+### P1. Real-engine latency < 1.5 s round-trip  *(biggest quality gap)*
+Measured all-CPU: STT ~1.0 s, RAG ~0.2–0.36 s, LLM ~0.28–0.8 s, **TTS ~3.6 s** →
+~6.5–8.4 s vs the 1.5 s gate (E2E bar still FAILs; `voice_budget_bar` reports it
+per interview). Levers, all machine/key-dependent:
+- GPU STT on the RTX 5060 Ti (install cuDNN/cuBLAS 12) or `tiny.en` model.
+- Kokoro int8 + shorter first sentences; cloud TTS (Cartesia key — engine already
+  implemented in `tts.py`).
+- Deepgram STT implemented, untested live (needs a key).
+- **New lever from T7:** `INTERVIEW_JUDGE_MODEL` (a faster judge shrinks the long
+  wait between answer and next question).
+
+### P2. Worker watchdog for the dev-server idle-drop
+`livekit-server --dev` drops a worker that idles ~20 s and it does not reliably
+re-register → start the interview promptly after `-WithVoice`; re-run the
+launcher between sessions (the page shows a hint when no interviewer joins
+within ~10 s). Future: supervisor that restarts the worker (P5 / production
+LiveKit server also removes the caveat).
 
 ### P3. Redis semantic cache → rubric cache-hit gate
 Docker/redis-stack was down → `cache_hit_rate` measured 0.0. Start Docker
 (+ `enterprise-rag-core`'s redis-stack container) to restore the Phase-1
 cache-gate metric (target 1.0).
 
-### P4. Voice session persistence to the management plane
-Worker summaries currently go to the browser only; `/sessions/{id}` registry
-is not populated for voice rooms. Future: worker → backend persistence
-(shared session store / summary POST) so interviews are reviewable after the
-call ends.
+### P4. Voice session persistence to the management plane (= 7.6)
+Worker summaries currently reach the browser only; `/sessions/{id}` registry is
+not populated with voice turns/scores. Future: worker → backend score/summary
+POST so interviews are reviewable after the call ends (incl. mid-session crash).
 
 ### P5. Production hardening
 - LiveKit Cloud or `livekit-server` with real keys (not `--dev`); HTTPS/WSS.
-- OIDC (`RAG_MCP_TOKEN`) end-to-end with voice.
-- The UI's mic/speaker flows on a real headset + browser matrix.
+- OIDC (`RAG_MCP_TOKEN`) is wired through the voice worker's `RagClient` —
+  needs an end-to-end run against a real IdP.
+- UI mic/speaker flows on a real headset + browser matrix (see P-A).
 
 ### P6. Quality loop
 - Evaluation harness for voice prompt A/B (pre-Phase-3 plan item).
-- Whisper mis-transcriptions measured (e.g. "Redis" → "Riddies"): log
-  per-utterance confidence; tune VAD thresholds/endpointing.
+- Whisper mis-transcriptions ("Redis" → "Riddies" measured): log per-utterance
+  confidence; tune VAD thresholds/endpointing. (Stops being cosmetic once 7.5 lands.)
 - Kokoro voice preset tuning (`INTERVIEW_KOKORO_VOICE`) per interviewer tone.
 
 ### P7. Repo housekeeping
-- Commit decision for the big uncommitted set (ERC folder, launcher, voice
-  files). Suggested `.gitignore` additions already applied: `.tools/`,
-  `*.wav`, `chroma_data/`, `.tunnel_*`.
-- `docs/CLAUDE.md`, `docs/READMEbkp.md`, `PLAN_start_services.md` are stale
-  backups — fold or remove.
+- **Commit decision still open** (owner: user): the large uncommitted set —
+  `enterprise-rag-core/`, launcher, voice files, and the 2026-09-03 T1–T8 fixes.
+  Suggested `.gitignore` additions already applied: `.tools/`, `*.wav`,
+  `chroma_data/`, `.tunnel_*`.
+- Stale backups to fold or remove: `docs/READMEbkp.md`, `docs/PLAN_start_services.md`,
+  `docs/PLAN_VOICE_PHASE3_BROWSER.md` (superseded by the RCA + this file);
+  root `CLAUDE.md` deleted (a doc-only change is staged in git).
 
 ---
 
@@ -100,6 +118,9 @@ call ends.
 cd D:\project\ai-mock-interviewer          # project root, not enterprise-rag-core
 .\start_services.ps1 -WithVoice            # boots RAG :8031 + backend :8010 + LiveKit :7880 + worker
 # 1) Browser:  http://127.0.0.1:8010/  → domain → Start → speak
-# 2) No-mic:   .venv\Scripts\python.exe -u scripts/e2e_voice_client.py --domain system-design --answers 5
+#    (manual checklist: docs/RCA_VOICE_BROWSER_INTERVIEW.md §5 — P-A above)
+# 2) No-mic:   .venv\Scripts\python.exe -u scripts/e2e_voice_client.py --domain system-design --answers 6
 # 3) Tests:    .venv\Scripts\python.exe -m pytest tests/ -m "not live"
 ```
+Stop the stack: `taskkill /F /IM python.exe /FI "PID NE <launcher-pid>"` — the
+launcher prints the exact command at boot (or Ctrl+C in its console).

@@ -25,11 +25,12 @@ except ImportError as exc:  # pragma: no cover - import-time guard
         "pip install -e '.[voice]'"
     ) from exc
 
+from interviewer.brain import PHASE_LABELS
 from interviewer.config import InterviewerConfig
 from interviewer.rag_client import RagClient
 from interviewer.state_machine import Session
 from interviewer.voice.interviewer import build_voice_interviewer
-from interviewer.voice.livekit import LiveKitAudioSink, LiveKitCandidate
+from interviewer.voice.livekit import EchoGate, LiveKitAudioSink, LiveKitCandidate
 from interviewer.voice.stt import resolve_stt
 
 log = logging.getLogger(__name__)
@@ -43,6 +44,14 @@ def domain_from_room(room_name: str, default: str = "system-design") -> str:
     if len(parts) >= 3 and parts[1] in DOMAINS:
         return parts[1]
     return default
+
+
+def is_page_event(event: dict) -> bool:
+    """True for events the browser renders. The brain's candidate-role turns
+    are superseded by ``candidate_heard`` (the STT-first echo) — dropping
+    them here prevents duplicate transcript lines on the page."""
+    return not (event.get("type") == "turn"
+                and event.get("role") == "candidate")
 
 
 async def run_agent(ctx: agents.JobContext) -> None:
@@ -60,19 +69,32 @@ async def run_agent(ctx: agents.JobContext) -> None:
         track, rtc.TrackPublishOptions(
             source=rtc.TrackSource.SOURCE_MICROPHONE))
     sink = LiveKitAudioSink(source, rtc=rtc)
+    gate = EchoGate()          # acoustic echo guard (T6) — uses sink.playing
 
     config = InterviewerConfig.from_env()
     domain = domain_from_room(ctx.room.name)
     rag = RagClient(config.rag_mcp_url, token=config.rag_mcp_token)
     session = Session(session_id=ctx.room.name, tenant_id="default",
                       domain=domain)
+    publish_lock = asyncio.Lock()
 
     async def publish_event(event: dict) -> None:
-        """Turn transcripts + the final summary reach the browser as LiveKit
-        data packets (topic ``interview``)."""
+        """Typed events reach the browser as LiveKit data packets (topic
+        ``interview``): ``state`` phase/label, interviewer ``turn`` texts,
+        ``candidate_heard`` (STT-first echo), per-question ``score``,
+        ``summary``, ``ended``. Candidate-role turns are filtered via
+        ``is_page_event``: the candidate's words already reached the page as
+        ``candidate_heard`` the moment STT returned — emitting the brain's
+        copy too would duplicate the transcript."""
+        if not is_page_event(event):
+            return
         try:
-            await ctx.room.local_participant.publish_data(
-                json.dumps(event).encode(), reliable=True, topic="interview")
+            # the brain task and the VAD consumer publish concurrently —
+            # serialize so packets never interleave on the wire
+            async with publish_lock:
+                await ctx.room.local_participant.publish_data(
+                    json.dumps(event).encode(), reliable=True,
+                    topic="interview")
         except Exception:
             log.exception("data publish failed")
 
@@ -88,18 +110,36 @@ async def run_agent(ctx: agents.JobContext) -> None:
 
     async def _consume_vad() -> None:
         """VAD events arrive by iterating the stream (push_frame is
-        fire-and-forget). START_OF_SPEECH = barge-in; END_OF_SPEECH carries
-        the buffered speech frame -> STT -> the brain's candidate queue."""
+        fire-and-forget). START_OF_SPEECH = barge-in (gated by EchoGate — the
+        interviewer's own voice never interrupts itself); END_OF_SPEECH
+        carries the buffered speech frame -> STT -> ``candidate_heard`` echo
+        -> the brain's candidate queue. The page sees ``state: transcribing``
+        while STT runs and ``candidate_heard`` the instant it returns, so the
+        candidate's words appear even if the brain later stalls (RCA 3.0.1)."""
         try:
             async for vad_ev in vad_stream:
+                now = time.time()
                 if vad_ev.type == agents.vad.VADEventType.START_OF_SPEECH:
-                    # barge-in: stop playback/generation (no-op when the
-                    # interviewer is not speaking)
-                    await interviewer.interrupt()
+                    if gate.on_speech_start(now, sink.playing):
+                        # barge-in: stop playback/generation (no-op when the
+                        # interviewer is not speaking)
+                        await interviewer.interrupt()
                 elif vad_ev.type == agents.vad.VADEventType.END_OF_SPEECH:
                     if not vad_ev.frames:
                         continue
                     # the frames are 16 kHz mono s16le (the VAD input rate)
+                    frames_ms = (sum(len(f.data) for f in vad_ev.frames)
+                                 / 2 / 16.0)   # samples / 16 kHz -> ms
+                    stop_ago_ms = ((now - sink.last_stop_ts) * 1000.0
+                                   if sink.last_stop_ts else float("inf"))
+                    if gate.on_speech_end(now, sink.playing, stop_ago_ms):
+                        log.info("echo tail dropped (%d ms utterance, "
+                                 "%.0f ms after playback stop)",
+                                 frames_ms, stop_ago_ms)
+                        continue
+                    await publish_event({
+                        "type": "state", "phase": "transcribing",
+                        "label": PHASE_LABELS["transcribing"]})
                     pcm = b"".join(f.data for f in vad_ev.frames)
                     t0 = time.perf_counter()
                     text = ""
@@ -111,6 +151,10 @@ async def run_agent(ctx: agents.JobContext) -> None:
                     if text:
                         log.info("candidate said (%d ms): %r",
                                  stt_ms, text[:80])
+                        # STT-first echo: the page renders the candidate's
+                        # words immediately, before the brain consumes them.
+                        await publish_event({
+                            "type": "candidate_heard", "text": text})
                         candidate.push(text, stt_ms)
         except Exception:
             log.exception("vad consumer failed")
@@ -150,6 +194,10 @@ async def run_agent(ctx: agents.JobContext) -> None:
              ctx.room.name, domain)
 
     async def run_brain() -> None:
+        """Run the FSM to completion, then publish ``ended`` so the page can
+        switch to its end-state instead of sitting "Connected" forever (RCA
+        R6 / T7)."""
+        reason = "interview complete — thank you for practicing"
         try:
             summary = await interviewer.run(f"bank-{domain}",
                                             candidate=candidate)
@@ -159,6 +207,9 @@ async def run_agent(ctx: agents.JobContext) -> None:
                      summary["stats"]["voice_budget_bar"])
         except Exception:
             log.exception("interviewer run failed")
+            reason = "interviewer error — please end the call and try again"
+        finally:
+            await publish_event({"type": "ended", "reason": reason})
 
     brain_task = asyncio.create_task(run_brain())
     listen_task = asyncio.create_task(listen())

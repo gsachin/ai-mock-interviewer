@@ -12,6 +12,7 @@ LiveKit audio source by a background playout task; barge-in clears the queue
 and stops the current frame mid-sentence.
 """
 import asyncio
+import time
 from typing import Any
 
 from interviewer.brain import CandidateAnswer
@@ -23,7 +24,10 @@ class LiveKitCandidate:
     ``push`` is called by the worker's VAD/STT loop; ``answer`` awaits the
     next transcript (in a live 1:1 interview the only speech between the
     question and the next turn is the candidate's answer, so ordering by
-    arrival is sufficient).
+    arrival is sufficient). ``answer`` is bounded by ``timeout_s`` — the
+    no-hang gate (RCA R1): it raises ``TimeoutError`` so the brain can
+    re-prompt and move on instead of waiting forever for a mic that never
+    delivers speech.
     """
 
     def __init__(self) -> None:
@@ -33,7 +37,8 @@ class LiveKitCandidate:
         if transcript.strip():
             self._queue.put_nowait((transcript.strip(), stt_ms))
 
-    async def answer(self, question_id: str) -> CandidateAnswer:
+    async def answer(self, question_id: str,
+                     timeout_s: float | None = None) -> CandidateAnswer:
         # Drop stale interjections that arrived while the interviewer was
         # still speaking (barge-in leftovers). The brain calls answer() the
         # moment it starts listening — anything already queued predates the
@@ -43,8 +48,52 @@ class LiveKitCandidate:
                 self._queue.get_nowait()
             except asyncio.QueueEmpty:
                 break
-        text, stt_ms = await self._queue.get()
+        if timeout_s is None:
+            text, stt_ms = await self._queue.get()
+        else:
+            text, stt_ms = await asyncio.wait_for(
+                self._queue.get(), timeout=timeout_s)
         return CandidateAnswer(text=text, stt_ms=stt_ms)
+
+
+class EchoGate:
+    """Acoustic echo guard for a speakers + mic setup (RCA R1/T6).
+
+    Pure decision logic (no livekit import — unit-testable): the worker's
+    VAD consumer asks it what a VAD event means while the interviewer's own
+    TTS may be feeding back into the mic. The consumer feeds it the sink's
+    playback state, so the gate keeps only per-utterance state.
+
+    Rules (echo discipline, RCA 3.2):
+    - Speech that STARTS while the interviewer is playing does not barge in —
+      the interviewer's own voice must never interrupt itself.
+    - An utterance that started during playback and ENDS just after playback
+      stopped (within ``tail_ms``) is the echo tail — dropped, never
+      transcribed as a candidate answer. Speech that ends while playback is
+      still going is genuine overlap and is kept.
+    """
+
+    def __init__(self, tail_ms: float = 250.0):
+        self.tail_ms = tail_ms
+        self._start_seen = False
+        self._started_while_playing = False
+
+    def on_speech_start(self, now: float, playing: bool) -> bool:
+        """START_OF_SPEECH decision: True = barge in (interrupt playback)."""
+        if not self._start_seen:
+            self._start_seen = True
+            self._started_while_playing = playing
+        return not playing                     # never self-interrupt
+
+    def on_speech_end(self, now: float, playing: bool,
+                      stop_ago_ms: float) -> bool:
+        """END_OF_SPEECH decision: True = drop the utterance as echo tail."""
+        started_while_playing = self._started_while_playing
+        self._start_seen = False               # reset for the next utterance
+        self._started_while_playing = False
+        if not started_while_playing:
+            return False
+        return (not playing) and stop_ago_ms <= self.tail_ms
 
 
 class LiveKitAudioSink:
@@ -57,6 +106,10 @@ class LiveKitAudioSink:
     queued — the brain then checks its barge-in flag and stops generating.
     The next ``play`` clears the stop flag, so the following turn plays
     normally.
+
+    ``playing`` and ``last_stop_ts`` expose the playout state to the worker's
+    echo gate (T6): True while frames are being delivered, and the timestamp
+    playback last ended.
     """
 
     FRAME_MS = 20  # 20 ms frames: smooth playout without flooding the queue
@@ -70,6 +123,11 @@ class LiveKitAudioSink:
         self._queue: asyncio.Queue[bytes] = asyncio.Queue()
         self._stop = False
         self._task: asyncio.Task | None = None
+        self.last_stop_ts: float | None = None
+
+    @property
+    def playing(self) -> bool:
+        return self._task is not None and not self._task.done()
 
     async def play(self, audio: bytes) -> None:
         """Queue one sentence (48 kHz mono s16le) for playback."""
@@ -85,6 +143,7 @@ class LiveKitAudioSink:
         The parked drain task (if any) wakes on the next play — its stop flag
         is consumed then, never carried into the next turn."""
         self._stop = True
+        self.last_stop_ts = time.time()        # echo gate: playback stopped
         while not self._queue.empty():
             try:
                 self._queue.get_nowait()
@@ -113,6 +172,7 @@ class LiveKitAudioSink:
                         samples_per_channel=frame_samples)
                     await self._source.capture_frame(frame)
                 if self._queue.empty():
+                    self.last_stop_ts = time.time()  # natural sentence end
                     self._task = None
                     return
         finally:

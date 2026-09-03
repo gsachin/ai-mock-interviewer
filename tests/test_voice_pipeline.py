@@ -10,13 +10,14 @@ import pytest
 from fastapi.testclient import TestClient
 
 from interviewer.config import InterviewerConfig
+from interviewer.state_machine import Session
 from interviewer.voice.audio_format import (
     f32le_to_s16le48k,
     s16le_to_s16le48k,
     wav_to_s16le48k,
 )
 from interviewer.voice.interviewer import AudioCandidate
-from interviewer.voice.livekit import LiveKitAudioSink, LiveKitCandidate
+from interviewer.voice.livekit import EchoGate, LiveKitAudioSink, LiveKitCandidate
 from interviewer.voice.stt import resolve_stt
 from interviewer.voice.tts import resolve_tts
 
@@ -193,3 +194,135 @@ def test_worker_refuses_stub_engines(monkeypatch):
             stt_provider="stub", tts_provider="stub")))
     with pytest.raises(SystemExit, match="real engines"):
         worker.main()
+
+
+# ── RCA fix regression tests (2026-09-03) ─────────────────────────────────────
+# T2: bounded candidate answer. T6: EchoGate decisions + sink playback state.
+# T3: worker page-event filter. T1/T7: session-shape wiring of the voice
+# factory (max_questions / answer_timeout / judge model).
+
+def test_livekit_candidate_answer_times_out():
+    """T2: answer() is bounded — a candidate whose mic never delivers speech
+    raises TimeoutError instead of blocking the brain forever."""
+    candidate = LiveKitCandidate()
+    with pytest.raises(TimeoutError):
+        run(candidate.answer("s1", timeout_s=0.05))
+
+
+# ── EchoGate (T6) ────────────────────────────────────────────────────────────
+
+def test_echo_gate_barges_in_only_when_not_playing():
+    gate = EchoGate()
+    assert gate.on_speech_start(1.0, playing=False) is True   # genuine answer
+    assert gate.on_speech_start(1.0, playing=True) is False   # no self-barge
+
+
+def test_echo_gate_drops_utterance_that_ends_right_after_playback_stop():
+    """The interviewer's own voice picked up by the mic: speech started
+    during playback and the utterance ends within the echo tail."""
+    gate = EchoGate(tail_ms=250.0)
+    gate.on_speech_start(t := 10.0, playing=True)
+    # playback stops at t+0.1 s; the VAD utterance ends 0.1 s later -> drop
+    assert gate.on_speech_end(t + 0.2, playing=False, stop_ago_ms=100.0)
+
+
+def test_echo_gate_keeps_speech_ending_long_after_playback_stopped():
+    gate = EchoGate(tail_ms=250.0)
+    gate.on_speech_start(t := 10.0, playing=True)
+    # the interviewer stopped, then the candidate kept going — genuine answer
+    assert not gate.on_speech_end(t + 5.0, playing=False, stop_ago_ms=4900.0)
+
+
+def test_echo_gate_keeps_genuine_overlap_while_still_playing():
+    gate = EchoGate(tail_ms=250.0)
+    gate.on_speech_start(10.0, playing=True)
+    # candidate talks over the interviewer; AEC keeps the mic open — keep it
+    assert not gate.on_speech_end(10.8, playing=True, stop_ago_ms=0.0)
+
+
+def test_echo_gate_keeps_fast_reply_started_after_playback():
+    gate = EchoGate(tail_ms=250.0)
+    gate.on_speech_start(10.0, playing=False)
+    assert not gate.on_speech_end(10.3, playing=False, stop_ago_ms=50.0)
+
+
+def test_echo_gate_resets_between_utterances():
+    gate = EchoGate(tail_ms=250.0)
+    gate.on_speech_start(10.0, playing=True)
+    gate.on_speech_end(10.1, playing=False, stop_ago_ms=100.0)   # dropped
+    # a new utterance that starts while NOT playing is a fresh answer
+    gate.on_speech_start(11.0, playing=False)
+    assert not gate.on_speech_end(11.2, playing=False, stop_ago_ms=0.0)
+
+
+# ── sink playback state (feeds the gate) ─────────────────────────────────────
+
+def test_livekit_sink_exposes_playing_and_last_stop():
+    source = FakeSource()
+    sink = LiveKitAudioSink(source, rtc=FakeRTC)
+
+    async def scenario():
+        await sink.play(b"\x01\x00" * 4800)          # 0.1 s sentence
+        await asyncio.sleep(0.02)                     # drain started
+        assert sink.playing is True
+        while sink._task is not None and not sink._task.done():
+            await asyncio.sleep(0.01)
+        assert sink.playing is False
+        assert sink.last_stop_ts is not None          # natural sentence end
+        await sink.play(b"\x02\x00" * 4800)
+        await asyncio.sleep(0.02)
+        await sink.interrupt()                        # barge-in
+        assert sink.last_stop_ts is not None
+
+    run(scenario())
+
+
+# ── worker page-event filter (T3) ────────────────────────────────────────────
+
+def test_worker_page_event_filter_drops_candidate_turns():
+    """candidate_heard (STT-first echo) supersedes the brain's candidate-role
+    turns — both must never reach the page or the transcript duplicates."""
+    from interviewer.voice import agent
+
+    assert agent.is_page_event({"type": "turn", "role": "interviewer",
+                                "text": "hi", "stage": "greeting"})
+    assert agent.is_page_event({"type": "candidate_heard", "text": "answer"})
+    assert agent.is_page_event({"type": "state", "phase": "listening",
+                                "label": "x"})
+    assert agent.is_page_event({"type": "score", "score": {}})
+    assert not agent.is_page_event({"type": "turn", "role": "candidate",
+                                    "text": "answer"})
+
+
+# ── voice factory session-shape wiring (T1/T7) ───────────────────────────────
+
+def test_voice_factory_threads_session_config(monkeypatch):
+    """INTERVIEW_MAX_QUESTIONS / INTERVIEW_ANSWER_TIMEOUT_S /
+    INTERVIEW_JUDGE_MODEL land on the brain and the judge LLM."""
+    from interviewer.voice import interviewer as vi
+    from interviewer.voice.stubs import StubSTT, StubTTS
+
+    captured: dict = {}
+
+    class FakeLLM:
+        def __init__(self, cfg):
+            captured["cfg"] = cfg
+
+        metrics = type("M", (), {"first_token_ms": 0.0, "total_ms": 0.0})()
+
+    monkeypatch.setattr(vi, "OpenAICompatibleLLM", FakeLLM)
+    monkeypatch.setattr(vi, "resolve_stt", lambda *a: StubSTT())
+    monkeypatch.setattr(vi, "resolve_tts", lambda *a: StubTTS())
+
+    cfg = InterviewerConfig(
+        stt_provider="stub", tts_provider="stub",
+        llm_base_url="http://127.0.0.1:8000/v1", llm_model="qwen2.5:14b",
+        max_questions=3, answer_timeout_s=12.5, judge_model="qwen2.5:3b")
+    iv = vi.build_voice_interviewer(
+        cfg, rag=object(),
+        session=Session(session_id="x", tenant_id="t", domain="ios"),
+        on_event=lambda e: None)
+
+    assert iv._max_questions == 3
+    assert iv._answer_timeout_s == 12.5
+    assert captured["cfg"].model == "qwen2.5:3b"   # judge override wins

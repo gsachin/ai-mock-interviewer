@@ -121,8 +121,63 @@ The deployed MLX server (`mlx_lm.server` on `:1234`,
 `mlx-community/Qwen2.5-14B-Instruct-4bit`) is reused as the live LLM — chat
 only, so embeddings stay on Ollama `nomic-embed-text`.
 
+## Phase 3: voice interview in the browser (LiveKit)
+
+One command boots the full voice stack (needs the `.tools/livekit/livekit-server.exe`
+binary — download the `windows_amd64` release zip from
+github.com/livekit/livekit/releases into `.tools/livekit/`):
+
+```powershell
+.\start_services.ps1 -WithVoice
+# Voice UI:  http://127.0.0.1:8010/   (pick a domain, Start, speak)
+# LiveKit:   http://127.0.0.1:7880    (dev mode, key devkey/secret)
+# Worker:    python -m interviewer.voice.worker (auto-started, PID in the summary)
+```
+
+What happens: the browser gets a LiveKit JWT from `POST /voice/token`
+(`interviewer/server.py`), joins room `interview-<domain>-<sid>`, and the
+worker's `run_agent` (`interviewer/voice/agent.py`) runs one interview per
+room: candidate audio → silero VAD → faster-whisper STT → `LLMInterviewer`
+(RAG over MCP, fast voice LLM llama3.2:3b) → Kokoro TTS sentence streaming →
+room playback, with barge-in. Transcripts + the final summary reach the page
+as LiveKit data packets.
+
+Manual run (equivalent env):
+
+```powershell
+$env:INTERVIEW_STT_PROVIDER = "faster-whisper"; $env:INTERVIEW_TTS_PROVIDER = "kokoro"
+$env:INTERVIEW_VOICE_LLM_BASE_URL = "http://127.0.0.1:11434/v1"; $env:INTERVIEW_VOICE_LLM_MODEL = "llama3.2:3b"
+$env:LIVEKIT_URL = "http://127.0.0.1:7880"; $env:LIVEKIT_API_KEY = "devkey"; $env:LIVEKIT_API_SECRET = "secret"
+python -m uvicorn interviewer.server:app --port 8010          # token endpoint + UI
+python -m interviewer.voice.worker                            # registers with :7880
+```
+
+Scripted end-to-end verification (no mic needed — pre-recorded Kokoro answers
+played into the room, asserts the interview completes and scores):
+
+```powershell
+python scripts/e2e_voice_client.py --domain system-design --answers 5
+```
+
+**Known dev-mode caveats (livekit-server `--dev`):**
+- The dev server drops a worker that idles ~20 s — a session started right
+  after boot works; for back-to-back sessions re-run `start_services.ps1
+  -WithVoice` (kill-stale handles both processes).
+- The < 1.5 s voice budget needs GPU/cloud engines: all-CPU faster-whisper +
+  Kokoro measure ~3.6 s TTS first audio + ~1 s STT (see `voice_budget_bar`
+  in the summary). The stage budgets (`interviewer/voice/budget.py`) keep the
+  bar measurable on real engines; llama3.2:3b first token is ~280 ms, RAG
+  ~200 ms.
+- First-run downloads: faster-whisper `base` model + Kokoro ONNX (~110 MB)
+  + silero VAD; Ollama needs `llama3.2:3b` pulled (`ollama pull llama3.2:3b`).
+- faster-whisper falls back CUDA→CPU automatically when the cuDNN/cuBLAS
+  runtime is missing; Windows Smart App Control can block PyAV ≥ 13 DLLs —
+  the `[voice]` extra pins `av==12.3.0`, which loads clean.
+
 ## Roadmap
 
-Phase 3: LiveKit voice pipeline (`pip install -e ".[voice]"`) — plug the
-brain's turns into STT/TTS engines and meet the < 1.5 s budget.
+Phase 3 is implemented and verified end-to-end (see the runbook above).
+Remaining quality work: get the real-engine round-trip under 1.5 s (GPU
+whisper / kokoro-int8 or cloud STT/TTS), persistent session summaries to the
+management plane, and the evaluation harness for prompt A/B tests.
 See `enterprise-rag-core`'s feasibility study + TRDs for the full plan.

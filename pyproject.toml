@@ -24,8 +24,21 @@ api = [
     "fastapi>=0.141,<1",
     "uvicorn[standard]>=0.52,<1",
 ]
+web = [
+    "streamlit>=1.40",        # web/streamlit_app.py — interactive text-mode interview UI
+]
 voice = [
-    "livekit-agents>=1",      # Phase 3: LiveKit agent worker (STT/TTS plugins, VAD, turn detection)
+    "livekit-agents>=1",      # Phase 3: LiveKit agent worker (VAD, turn detection, rtc)
+    "livekit-api>=1",         # AccessToken for the /voice/token endpoint
+    "livekit-plugins-silero>=1",  # silero VAD
+    "faster-whisper>=1.1",    # self-hosted STT (CTranslate2, lazy model load)
+    "kokoro-onnx>=0.2",       # self-hosted natural TTS (no espeak-ng/torch needed)
+    "numpy>=2",               # audio format conversion (48k s16le frames)
+    # Pinned: PyAV >= 13 is blocked by Windows Smart App Control on some
+    # machines (unsigned DLLs, "An Application Control policy has blocked
+    # this file"); 12.3.0 loads clean. livekit-agents only needs av for its
+    # codec utils, which the interviewer pipeline never exercises.
+    "av==12.3.0",
 ]
 dev = [
     "pytest>=8",

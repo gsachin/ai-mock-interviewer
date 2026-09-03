@@ -3,59 +3,148 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Mock Interviewer — Voice Room</title>
+  <title>AI Mock Interviewer — Voice</title>
   <style>
-    body { font-family: system-ui, sans-serif; max-width: 640px; margin: 40px auto; padding: 0 16px; }
-    button { font-size: 16px; padding: 10px 18px; }
-    #status { color: #666; margin: 12px 0; }
-    #log { white-space: pre-wrap; background: #f4f4f4; border-radius: 8px; padding: 12px; min-height: 120px; }
+    :root { --bg:#0f1115; --panel:#171a21; --accent:#4f8cff; --ok:#2ecc71; --text:#e6e8ee; --dim:#8a90a0; }
+    * { box-sizing: border-box; }
+    body { font-family: system-ui, sans-serif; background: var(--bg); color: var(--text);
+           max-width: 720px; margin: 0 auto; padding: 24px 16px 48px; }
+    h1 { font-size: 22px; margin: 0 0 4px; }
+    .sub { color: var(--dim); font-size: 13px; margin-bottom: 20px; }
+    .setup { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; margin-bottom: 16px; }
+    select, button { font-size: 15px; padding: 10px 14px; border-radius: 8px; border: 1px solid #2a2f3a;
+                     background: var(--panel); color: var(--text); cursor: pointer; }
+    button.primary { background: var(--accent); border-color: var(--accent); color: #fff; font-weight: 600; }
+    button:disabled { opacity: .45; cursor: default; }
+    button.danger { background: #a33; border-color: #a33; color: #fff; }
+    #status { color: var(--dim); font-size: 14px; margin-bottom: 12px; min-height: 18px; }
+    #status.live { color: var(--ok); }
+    #transcript { background: var(--panel); border-radius: 10px; padding: 14px; min-height: 220px;
+                  max-height: 46vh; overflow-y: auto; margin-bottom: 14px; }
+    .msg { margin: 0 0 10px; line-height: 1.45; }
+    .msg .who { font-size: 12px; font-weight: 600; letter-spacing: .4px; }
+    .msg.interviewer .who { color: var(--accent); }
+    .msg.candidate .who { color: var(--ok); }
+    .msg .text { white-space: pre-wrap; }
+    #scores { background: var(--panel); border-radius: 10px; padding: 14px; margin-bottom: 14px; }
+    #scores h2 { font-size: 15px; margin: 0 0 10px; }
+    #scores table { width: 100%; border-collapse: collapse; font-size: 13px; }
+    #scores th, #scores td { text-align: left; padding: 5px 8px; border-bottom: 1px solid #232834; }
+    .stats { color: var(--dim); font-size: 13px; margin-top: 10px; }
   </style>
 </head>
 <body>
-  <h1>Mock Interviewer — Voice Room</h1>
-  <p>Joins a LiveKit room and streams mic audio to the interviewer agent
-  (Phase 3). Requires a LiveKit server URL and a token endpoint — see the
-  README runbook; this page is a thin client, all interviewer logic runs
-  server-side in the agent worker.</p>
-  <button id="join">Join room</button>
-  <div id="status">Not connected.</div>
-  <div id="log"></div>
+  <h1>🎤 AI Mock Interviewer</h1>
+  <div class="sub">Voice interview — the interviewer speaks, you answer, it scores. All audio runs through a local LiveKit room.</div>
+
+  <div class="setup">
+    <label for="domain">Domain</label>
+    <select id="domain">
+      <option value="system-design" selected>System Design</option>
+      <option value="ios">iOS</option>
+      <option value="dsa">DSA</option>
+      <option value="devops">DevOps</option>
+    </select>
+    <button id="start" class="primary">Start voice interview</button>
+    <button id="hangup" class="danger" disabled hidden>End call</button>
+  </div>
+
+  <div id="status">Idle — pick a domain and start. Your microphone will be requested.</div>
+  <div id="transcript"></div>
+  <div id="scores" hidden></div>
 
   <script src="https://cdn.jsdelivr.net/npm/livekit-client@2/dist/livekit-client.umd.min.js"></script>
   <script>
-    const joinBtn = document.getElementById("join");
-    const statusEl = document.getElementById("status");
-    const logEl = document.getElementById("log");
+    const $ = (id) => document.getElementById(id);
+    const statusEl = $("status"), transcriptEl = $("transcript"), scoresEl = $("scores");
+    const startBtn = $("start"), hangupBtn = $("hangup");
+    let room = null;
 
-    joinBtn.addEventListener("click", async () => {
-      const url = localStorage.getItem("livekit_url") || prompt("LiveKit server URL (wss://...)");
-      const token = localStorage.getItem("livekit_token") || prompt("Access token (JWT)");
-      if (!url || !token) return;
-      localStorage.setItem("livekit_url", url);
-      localStorage.setItem("livekit_token", token);
+    function setStatus(text, live) {
+      statusEl.textContent = text;
+      statusEl.classList.toggle("live", !!live);
+    }
 
-      const room = new LivekitClient.Room();
-      room.on(LivekitClient.RoomEvent.TrackSubscribed, (track) => {
-        if (track.kind === "audio") {
-          const el = track.attach();
-          el.autoplay = true;
-          document.body.appendChild(el);
-          logEl.textContent += "audio track attached\n";
-        }
-      });
-      room.on(LivekitClient.RoomEvent.Disconnected, () => {
-        statusEl.textContent = "Disconnected.";
-      });
+    function addMessage(role, text) {
+      const div = document.createElement("div");
+      div.className = "msg " + role;
+      div.innerHTML = `<div class="who">${role === "interviewer" ? "INTERVIEWER" : "YOU"}</div>
+                       <div class="text"></div>`;
+      div.querySelector(".text").textContent = text;
+      transcriptEl.appendChild(div);
+      transcriptEl.scrollTop = transcriptEl.scrollHeight;
+    }
 
-      await room.connect(url, token);
-      statusEl.textContent = "Connected — requesting mic...";
+    function renderScores(summary) {
+      const s = summary.stats || {};
+      const rows = (summary.scores || []).map(e => `
+        <tr><td>${e.question_id}</td><td>${e.section_title || ""}</td>
+            <td>${Object.entries(e.scores).map(([k, v]) => k.slice(0, 3) + " " + v).join(" · ")}</td>
+            <td>${e.followup_asked ? "yes" : "no"}</td></tr>`).join("");
+      scoresEl.innerHTML = `
+        <h2>Interview complete</h2>
+        <table><tr><th>Question</th><th>Section</th><th>Scores (cor/dep/com)</th><th>Follow-up</th></tr>${rows}</table>
+        <div class="stats">
+          Average score: <b>${s.average_score ?? "–"} / 5</b> ·
+          Rubric cache hit rate: <b>${s.cache_hit_rate ?? "–"}</b> ·
+          Wall: <b>${s.wall_ms ?? "–"} ms</b><br>
+          Voice budget: <b>${s.voice_budget_bar || "–"}</b>
+        </div>`;
+      scoresEl.hidden = false;
+    }
+
+    function onData(payload, participant, kind, topic) {
+      if (topic !== "interview") return;
+      let event;
+      try { event = JSON.parse(new TextDecoder().decode(payload)); }
+      catch { return; }
+      if (event.type === "turn" && event.text) addMessage(event.role, event.text);
+      else if (event.type === "summary") { addMessage("interviewer", "— Interview over. Thanks for practicing! —"); renderScores(event.summary); }
+    }
+
+    startBtn.addEventListener("click", async () => {
+      startBtn.disabled = true;
+      setStatus("Requesting room token…");
       try {
+        const resp = await fetch("/voice/token", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ domain: $("domain").value }),
+        });
+        if (!resp.ok) throw new Error("token request failed: " + resp.status);
+        const { livekit_url, token } = await resp.json();
+
+        room = new LivekitClient.Room();
+        room.on(LivekitClient.RoomEvent.TrackSubscribed, (track) => {
+          if (track.kind === LivekitClient.Track.Kind.Audio) {
+            const el = track.attach();
+            el.autoplay = true;
+            document.body.appendChild(el);
+          }
+        });
+        room.on(LivekitClient.RoomEvent.DataReceived, onData);
+        room.on(LivekitClient.RoomEvent.Disconnected, () => {
+          setStatus("Disconnected.");
+          transcriptEl.scrollTop = transcriptEl.scrollHeight;
+          startBtn.disabled = false;
+          hangupBtn.hidden = true;
+          room = null;
+        });
+
+        await room.connect(livekit_url, token);
+        setStatus("Connected — enabling microphone…", true);
         await room.localParticipant.setMicrophoneEnabled(true);
-        logEl.textContent += "mic live — the interviewer agent should greet you\n";
+        setStatus("Interview live. The interviewer will greet you — answer aloud, and you can interrupt it anytime.", true);
+        transcriptEl.innerHTML = "";
+        scoresEl.hidden = true;
+        hangupBtn.hidden = false;
       } catch (e) {
-        statusEl.textContent = "Mic error: " + e.message;
+        setStatus("Error: " + e.message);
+        startBtn.disabled = false;
       }
     });
+
+    hangupBtn.addEventListener("click", () => { if (room) room.disconnect(); });
   </script>
 </body>
 </html>

@@ -30,11 +30,13 @@ class AudioCandidate:
 
 
 def build_voice_interviewer(config: InterviewerConfig, rag: Any,
-                            session: Any) -> LLMInterviewer:
+                            session: Any, sink: Any = None,
+                            on_event: Any = None) -> LLMInterviewer:
     """Voice-enabled brain: STT/TTS engines from config, a fast voice LLM
-    for the hot path (falls back to the judge LLM), and a fresh latency
-    budget tracker. The judge LLM stays as configured (slow is fine — its
-    wait is measured and reported as judge_wait_ms)."""
+    for the hot path (falls back to the judge LLM), a fresh latency budget
+    tracker, and an optional playback sink (the LiveKit room). The judge LLM
+    stays as configured (slow is fine — its wait is measured and reported as
+    judge_wait_ms)."""
     stt = resolve_stt(config.stt_provider, config)
     tts = resolve_tts(config.tts_provider, config)
     voice_llm = None
@@ -52,4 +54,6 @@ def build_voice_interviewer(config: InterviewerConfig, rag: Any,
         tts=tts,
         voice_llm=voice_llm,
         budget=LatencyBudgetTracker(),
+        sink=sink,
+        on_event=on_event,
     )

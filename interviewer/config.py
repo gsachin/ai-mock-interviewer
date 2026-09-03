@@ -33,8 +33,15 @@ class InterviewerConfig:
     elevenlabs_api_key: str | None = None
     piper_binary: str = "piper"
     piper_model: str | None = None
+    kokoro_voice: str = "af_heart"     # high-quality natural preset
+    kokoro_model_dir: str | None = None  # None = ~/.cache/mock-interviewer/kokoro
     voice_llm_base_url: str | None = None
     voice_llm_model: str | None = None
+    # Phase 3 voice: LiveKit deployment. The worker and the /voice/token
+    # endpoint share these; unset keys = LiveKit dev-mode defaults.
+    livekit_url: str = "http://127.0.0.1:7880"
+    livekit_api_key: str | None = None      # dev mode: "devkey"
+    livekit_api_secret: str | None = None   # dev mode: "secret"
 
     @classmethod
     def from_env(cls, environ: dict[str, str] | None = None) -> "InterviewerConfig":
@@ -59,6 +66,11 @@ class InterviewerConfig:
             elevenlabs_api_key=env.get("INTERVIEW_ELEVENLABS_API_KEY"),
             piper_binary=env.get("INTERVIEW_PIPER_BINARY", "piper"),
             piper_model=env.get("INTERVIEW_PIPER_MODEL"),
+            kokoro_voice=env.get("INTERVIEW_KOKORO_VOICE", "af_heart"),
+            kokoro_model_dir=env.get("INTERVIEW_KOKORO_MODEL_DIR"),
             voice_llm_base_url=env.get("INTERVIEW_VOICE_LLM_BASE_URL"),
             voice_llm_model=env.get("INTERVIEW_VOICE_LLM_MODEL"),
+            livekit_url=env.get("LIVEKIT_URL", "http://127.0.0.1:7880"),
+            livekit_api_key=env.get("LIVEKIT_API_KEY"),
+            livekit_api_secret=env.get("LIVEKIT_API_SECRET"),
         )

@@ -1,0 +1,84 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "enterprise-rag-core"
+version = "0.1.0"
+description = "Standalone, pluggable Enterprise RAG/MCP Core Engine: hybrid retrieval (vector + keyword), weighted RRF fusion, ONNX reranking, tenant-scoped semantic cache, document ingestion, and an MCP server (OIDC or no-auth)."
+readme = "README.md"
+requires-python = ">=3.11,<3.14"
+license = { text = "Proprietary" }
+authors = [{ name = "Pradeep" }]
+keywords = ["rag", "mcp", "retrieval", "hybrid-search", "semantic-cache", "multi-tenant"]
+classifiers = [
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+]
+
+# Core dependencies are intentionally lightweight: every backend SDK is an
+# optional extra, so a system can adopt the engine with zero or partial infra.
+dependencies = [
+    "httpx>=0.28,<1",
+    "pydantic>=2.12,<3",
+    "numpy>=2.0,<3",          # 2.5.x requires Python >= 3.12; 2.4.6 pinned for dev (3.11)
+    "tokenizers>=0.23,<1",
+    "onnxruntime>=1.20,<2",
+]
+
+[project.optional-dependencies]
+mcp = [
+    "mcp>=2.1.1,<3",          # PyJWT arrives via mcp's pyjwt[crypto] dependency
+    "pyjwt[crypto]>=2.13,<3",
+]
+chroma = ["chromadb>=1.0,<2"]
+qdrant = ["qdrant-client>=1.19,<2"]
+elasticsearch = [
+    "elasticsearch>=9.5,<10",
+    "elastic-transport>=9.4,<10",
+]
+redisvl = [
+    "redis>=7.4,<8",          # redisvl 0.26.x requires redis<8.0
+    "redisvl>=0.26,<1",
+]
+ingest = ["pypdf>=6.14,<7"]
+dev = [
+    "pytest>=8",
+    "fpdf2>=2.8,<3",
+    "uvicorn[standard]>=0.52,<1",
+    "h2>=4.4,<5",             # HTTP/2 for the streamable-HTTP MCP transport
+    "mcp>=2.1.1,<3",
+    "pyjwt[crypto]>=2.13,<3",
+    "chromadb>=1.0,<2",
+    "qdrant-client>=1.19,<2",
+    "elasticsearch>=9.5,<10",
+    "elastic-transport>=9.4,<10",
+    "redis>=7.4,<8",
+    "redisvl>=0.26,<1",
+    "pypdf>=6.14,<7",
+]
+all = [
+    "mcp>=2.1.1,<3",
+    "pyjwt[crypto]>=2.13,<3",
+    "chromadb>=1.0,<2",
+    "qdrant-client>=1.19,<2",
+    "elasticsearch>=9.5,<10",
+    "elastic-transport>=9.4,<10",
+    "redis>=7.4,<8",
+    "redisvl>=0.26,<1",
+    "pypdf>=6.14,<7",
+]
+
+[project.scripts]
+enterprise-rag-core = "enterprise_rag.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["enterprise_rag*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "redis: tests that need a reachable Redis Stack server (auto-skip otherwise)",
+    "ollama: tests that need a reachable Ollama embedding endpoint (auto-skip otherwise)",
+]

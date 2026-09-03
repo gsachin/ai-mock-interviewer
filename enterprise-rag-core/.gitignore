@@ -1,0 +1,19 @@
+# Virtual environments
+.venv/
+venv/
+
+# Models (downloaded at first run — enterprise-rag-core download-model)
+models/
+
+# Local ChromaDB data (default RAG_CORE_CHROMA_PATH)
+chroma_data/
+
+# Python artifacts
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/

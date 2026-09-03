@@ -15,7 +15,7 @@ turn for the < 1.5 s gate.
 """
 import time
 from dataclasses import dataclass
-from typing import Any, Protocol
+from typing import Any, Awaitable, Callable, Protocol
 
 from interviewer.llm import OpenAICompatibleLLM
 from interviewer.prompts import (
@@ -30,6 +30,7 @@ from interviewer.prompts import (
 from interviewer.scoring import Evaluation, parse_evaluation
 from interviewer.state_machine import InterviewerEvent, Session, Turn
 from interviewer.voice.budget import LatencyBudgetTracker
+from interviewer.voice.protocols import AudioSink
 from interviewer.voice.splitter import SentenceAccumulator
 
 
@@ -79,7 +80,9 @@ class LLMInterviewer:
                  # Phase 3 voice extensions (all optional — text mode needs none):
                  tts: Any = None,
                  voice_llm: OpenAICompatibleLLM | None = None,
-                 budget: LatencyBudgetTracker | None = None):
+                 budget: LatencyBudgetTracker | None = None,
+                 sink: AudioSink | None = None,
+                 on_event: Callable[[dict], Awaitable[None]] | None = None):
         self._rag = rag
         self._llm = llm
         self._session = session
@@ -90,6 +93,8 @@ class LLMInterviewer:
         self.tts = tts
         self._voice_llm = voice_llm
         self._budget = budget
+        self._sink = sink
+        self._on_event = on_event
         self._interrupted = False
         self._last_stt_ms = 0.0
         self._last_rag_ms = 0.0
@@ -103,10 +108,22 @@ class LLMInterviewer:
     async def interrupt(self) -> None:
         """Barge-in: stop speaking at the next sentence boundary. The FSM
         caller then transitions to LISTEN. Never raises — the LLM stream
-        drains silently until the next boundary check."""
+        drains silently until the next boundary check. In voice mode the
+        playback sink is interrupted too (mid-sentence audio stops at once)."""
         self._interrupted = True
+        if self._sink is not None:
+            await self._sink.interrupt()
 
     # ── turn helpers ────────────────────────────────────────────────────────
+
+    async def _emit(self, event: dict[str, Any]) -> None:
+        """Push a UI event (turn transcript / final summary) to the optional
+        subscriber — the LiveKit worker publishes these as data packets."""
+        if self._on_event is not None:
+            try:
+                await self._on_event(event)
+            except Exception:  # telemetry never breaks the interview
+                pass
 
     def _hop(self, stage: str, *, rag_ms: float = 0.0, **extra: Any) -> dict[str, Any]:
         """Snapshot one hop's latency: the last call's LLM metrics + the RAG
@@ -149,7 +166,11 @@ class LLMInterviewer:
         audio: list[bytes] = []
 
         async def _synth(sentence: str) -> None:
-            audio.append(await self.tts.synthesize(sentence))
+            data = await self.tts.synthesize(sentence)
+            if self._sink is not None:
+                await self._sink.play(data)      # voice mode: play it
+            else:
+                audio.append(data)               # dev/text mode: nothing to play
             if self._last_tts_ms == 0.0:
                 self._last_tts_ms = (time.perf_counter() - t0) * 1000
 
@@ -195,6 +216,8 @@ class LLMInterviewer:
 
         greeting = await self._speak(build_greeting_prompt(s.domain))
         s.turns.append(Turn("interviewer", greeting))
+        await self._emit({"type": "turn", "role": "interviewer",
+                          "text": greeting, "stage": "greeting"})
         hops.append(self._hop("greeting"))
         s.transition(InterviewerEvent.GREETED)
 
@@ -209,11 +232,15 @@ class LLMInterviewer:
             spoken_question = await self._speak(
                 build_question_prompt(question.formatted, ref.question_id))
             s.turns.append(Turn("interviewer", spoken_question))
+            await self._emit({"type": "turn", "role": "interviewer",
+                              "text": spoken_question, "stage": "question"})
             hops.append(self._hop("question", question_id=ref.question_id))
 
             answer = (await candidate.answer(ref.question_id))
             self._last_stt_ms = answer.stt_ms
             s.turns.append(Turn("candidate", answer.text))
+            await self._emit({"type": "turn", "role": "candidate",
+                              "text": answer.text})
             s.transition(InterviewerEvent.ANSWER_RECEIVED)       # -> EVALUATE
 
             followup_asked = False
@@ -246,11 +273,16 @@ class LLMInterviewer:
                     spoken_followup = await self._speak(
                         build_followup_prompt(evaluation.followup))
                     s.turns.append(Turn("interviewer", spoken_followup))
+                    await self._emit({"type": "turn", "role": "interviewer",
+                                      "text": spoken_followup,
+                                      "stage": "followup"})
                     hops.append(self._hop("followup", question_id=ref.question_id))
                     s.transition(InterviewerEvent.FOLLOWUP_ASKED)    # -> LISTEN
                     followup_answer = await candidate.answer(f"{ref.question_id}:followup")
                     self._last_stt_ms = followup_answer.stt_ms
                     s.turns.append(Turn("candidate", followup_answer.text))
+                    await self._emit({"type": "turn", "role": "candidate",
+                                      "text": followup_answer.text})
                     answer = followup_answer
                     s.transition(InterviewerEvent.ANSWER_RECEIVED)   # -> EVALUATE
                     continue    # judge the follow-up answer this round
@@ -274,13 +306,15 @@ class LLMInterviewer:
             avg = sum(all_scores) / len(all_scores)
         closing = await self._speak(build_wrap_prompt(avg))
         s.turns.append(Turn("interviewer", closing))
+        await self._emit({"type": "turn", "role": "interviewer",
+                          "text": closing, "stage": "wrap"})
         hops.append(self._hop("wrap"))
         s.transition(InterviewerEvent.SESSION_ENDED)
 
         llm_ft = [h["llm_first_token_ms"] for h in hops if h["llm_first_token_ms"]]
         llm_tot = [h["llm_total_ms"] for h in hops if h["llm_total_ms"]]
         rag_tot = [h["rag_total_ms"] for h in hops if h["rag_total_ms"]]
-        return {
+        summary = {
             "session_id": s.session_id,
             "tenant_id": s.tenant_id,
             "domain": s.domain,
@@ -307,3 +341,5 @@ class LLMInterviewer:
                 "wall_ms": round((time.perf_counter() - t_start) * 1000, 1),
             },
         }
+        await self._emit({"type": "summary", "summary": summary})
+        return summary

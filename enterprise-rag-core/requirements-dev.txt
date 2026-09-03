@@ -1,0 +1,42 @@
+# Dev/test environment pins — verified against these exact versions (2026-08-27).
+# The package itself declares ranges in pyproject.toml; this file pins the
+# verified set for reproducible local development and the test suite.
+#
+# Re-verify before adopting newer releases (see
+# docs/TRD_ENTERPRISE_RAG_MCP_CORE.md §Pinned Versions).
+
+# Core
+httpx==0.28.1
+pydantic==2.13.4
+numpy==2.4.6                 # 2.5.x requires Python >= 3.12
+tokenizers==0.23.1
+onnxruntime==1.29.0          # GPU build 1.28.x OK on Windows
+
+# MCP server
+mcp==2.1.1
+PyJWT[crypto]==2.13.0
+fastapi==0.141.1             # via MCP SDK
+starlette==1.6.0
+uvicorn[standard]==0.52.4
+h2==4.4.1                    # HTTP/2 (uvicorn 0.52.4 has no h2 extra)
+sse-starlette==3.4.8
+mcp-types==2.1.1
+
+# Vector stores
+qdrant-client==1.19.0
+chromadb==1.5.9
+
+# Keyword leg
+elasticsearch==9.5.0
+elastic-transport==9.4.2     # pinned for HttpxAsyncHttpNode transport
+
+# Semantic cache
+redis==7.4.1                 # redisvl 0.26.0 requires redis<8.0
+redisvl==0.26.0
+
+# Ingestion
+pypdf==6.14.2
+
+# Tests
+pytest>=8
+fpdf2==2.8.7

@@ -5,10 +5,16 @@ may be resolved — robotic espeak-class engines never ship. Preference
 order: elevenlabs, cartesia (cloud), kokoro, piper (self-hosted).
 """
 import asyncio
+import os
 import subprocess
 
 import httpx
 
+from interviewer.voice.audio_format import (
+    f32le_to_s16le48k,
+    mp3_to_s16le48k,
+    wav_to_s16le48k,
+)
 from interviewer.voice.protocols import TTSEngine
 
 NATURAL_VOICE_PROVIDERS = {"elevenlabs", "cartesia", "kokoro", "piper", "stub"}
@@ -44,7 +50,7 @@ class CartesiaTTS:
                 },
             )
             resp.raise_for_status()
-            return resp.content
+            return f32le_to_s16le48k(resp.content, 24000)
 
 
 class ElevenLabsTTS:
@@ -68,7 +74,7 @@ class ElevenLabsTTS:
                 json={"text": text, "model_id": self._model_id},
             )
             resp.raise_for_status()
-            return resp.content
+            return mp3_to_s16le48k(resp.content)
 
 
 class PiperTTS:
@@ -89,7 +95,60 @@ class PiperTTS:
                                   check=True)
             return proc.stdout
 
-        return await asyncio.to_thread(_run)
+        wav = await asyncio.to_thread(_run)
+        return wav_to_s16le48k(wav)
+
+
+class KokoroTTS:
+    """Self-hosted Kokoro via ``kokoro-onnx`` — no torch/espeak-ng needed.
+
+    Model + voice files (~110 MB total) download once into the cache dir on
+    first synthesis. Emits 48 kHz mono s16le per the format contract."""
+
+    MODEL_URL = ("https://github.com/thewh1teagle/kokoro-onnx/releases/"
+                 "download/model-files-v1.1/kokoro-v1.0.onnx")
+    VOICES_URL = ("https://github.com/thewh1teagle/kokoro-onnx/releases/"
+                  "download/model-files-v1.1/voices-v1.0.bin")
+
+    def __init__(self, voice: str, model_dir: str | None = None):
+        self._voice = voice
+        self._model_dir = model_dir or os.path.join(
+            os.path.expanduser("~"), ".cache", "mock-interviewer", "kokoro")
+        self._kokoro = None
+
+    def _ensure_engine(self):
+        if self._kokoro is None:
+            from kokoro_onnx import Kokoro  # lazy: the [voice] extra
+
+            model_path = self._download(self.MODEL_URL, "kokoro-v1.0.onnx")
+            voices_path = self._download(self.VOICES_URL, "voices-v1.0.bin")
+            self._kokoro = Kokoro(model_path, voices_path)
+        return self._kokoro
+
+    def _download(self, url: str, filename: str) -> str:
+        os.makedirs(self._model_dir, exist_ok=True)
+        path = os.path.join(self._model_dir, filename)
+        if os.path.exists(path):
+            return path
+        print(f"[kokoro] downloading {filename} -> {path}")
+        with httpx.Client(follow_redirects=True, timeout=600.0) as client:
+            with client.stream("GET", url) as resp:
+                resp.raise_for_status()
+                with open(path, "wb") as f:
+                    for chunk in resp.iter_bytes():
+                        f.write(chunk)
+        return path
+
+    async def synthesize(self, text: str) -> bytes:
+        kokoro = await asyncio.to_thread(self._ensure_engine)
+
+        def _synth():
+            samples, sample_rate = kokoro.create(
+                text, voice=self._voice, speed=1.0, lang="en-us")
+            return samples, sample_rate
+
+        samples, sample_rate = await asyncio.to_thread(_synth)
+        return f32le_to_s16le48k(samples.astype("<f4").tobytes(), sample_rate)
 
 
 def resolve_tts(provider: str, config) -> TTSEngine:
@@ -112,8 +171,7 @@ def resolve_tts(provider: str, config) -> TTSEngine:
     if provider == "piper":
         return PiperTTS(config.piper_binary, config.piper_model)
     if provider == "kokoro":
-        raise ValueError("tts_provider=kokoro is allowlisted but not yet wired — "
-                         "use piper for self-hosted audio today")
+        return KokoroTTS(config.kokoro_voice, config.kokoro_model_dir)
     from interviewer.voice.stubs import StubTTS
 
     return StubTTS()

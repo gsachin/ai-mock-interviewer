@@ -26,7 +26,12 @@ class TTSEngine(Protocol):
     """
 
     async def synthesize(self, text: str) -> bytes:
-        """Audio bytes for one spoken sentence (sentence-level chunking)."""
+        """Audio bytes for one spoken sentence (sentence-level chunking).
+
+        Format contract: **48 kHz mono s16le PCM** (the LiveKit room format,
+        see ``interviewer.voice.audio_format``) — playback sinks need no
+        conversion.
+        """
         ...
 
 
@@ -37,3 +42,16 @@ class LLMEngine(Protocol):
     async def respond_stream(self, messages: list[dict]) -> AsyncIterator[str]:
         """Yield text deltas — TTS starts on sentence one, not on completion."""
         ...
+
+
+class AudioSink(Protocol):
+    """Playback sink for synthesized interviewer audio (48 kHz mono s16le).
+
+    ``play`` hands one sentence to the sink — implementations may queue and
+    return immediately (a LiveKit audio source) or block until playback ends.
+    ``interrupt`` stops playback at once (barge-in).
+    """
+
+    async def play(self, audio: bytes) -> None: ...
+
+    async def interrupt(self) -> None: ...

@@ -7,3 +7,5 @@ dist/
 build/
 .env
 gate_results/
+.tools/
+*.wav

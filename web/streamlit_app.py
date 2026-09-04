@@ -60,6 +60,42 @@ class QueueCandidate:
         return CandidateAnswer(text=text)
 
 
+class QueueReviewer:
+    """Review gate for the text UI (voice-parity pacing): after every scored
+    question the brain asks the decider for Retake / Next. ``decide()`` posts
+    a ``{"type": "review", ...}`` marker into ``requests`` and blocks until
+    the page pushes a choice into ``responses`` — the same shape as
+    QueueCandidate, but consumed by the review branch of the page.
+
+    Honors ``timeout_s`` (the brain's review budget, default 90 s): no choice
+    in time ⇒ auto-advance (``TimeoutError`` ⇒ the brain moves on), exactly
+    like the voice page's gate.
+    """
+
+    def __init__(self, requests: "queue.Queue", responses: "queue.Queue"):
+        self._requests = requests
+        self._responses = responses
+
+    async def decide(self, question_id: str,
+                     timeout_s: float | None = None,
+                     drop_before_ts: float | None = None) -> str:
+        marker = {"type": "review", "question_id": question_id}
+        self._requests.put(marker)
+        try:
+            if timeout_s:
+                text = await asyncio.wait_for(
+                    asyncio.to_thread(self._responses.get), timeout_s)
+            else:
+                text = await asyncio.to_thread(self._responses.get)
+        except asyncio.TimeoutError as exc:
+            try:
+                self._requests.queue.remove(marker)  # never leave a stale gate
+            except ValueError:
+                pass
+            raise TimeoutError("review decision timed out") from exc
+        return text if text in ("retake", "next") else "next"
+
+
 def _run_interview(ctx: dict) -> None:
     """Worker: drive the full FSM to completion inside one asyncio loop."""
     try:
@@ -68,7 +104,8 @@ def _run_interview(ctx: dict) -> None:
         llm = OpenAICompatibleLLM(LLMConfig(
             base_url=config.llm_base_url, model=config.llm_model, token=config.llm_token))
         interviewer = LLMInterviewer(rag, llm, ctx["session"],
-                                     max_questions=ctx["max_questions"])
+                                     max_questions=ctx["max_questions"],
+                                     decider=ctx["reviewer"])
         summary = asyncio.run(interviewer.run(ctx["doc_id"], candidate=ctx["candidate"]))
         store = (RedisSessionStore(config.redis_url) if config.session_store == "redis"
                  else InMemorySessionStore())
@@ -82,6 +119,25 @@ def _turn_parts(turn) -> tuple:
     if isinstance(turn, dict):
         return turn.get("role"), turn.get("text")
     return getattr(turn, "role", None), getattr(turn, "text", None)
+
+
+_VERDICT_GLYPH = {"correct": "✅", "partial": "◐", "incorrect": "❌"}
+
+
+def _feedback_text(entry: dict) -> str:
+    """One question's judge feedback as markdown — verdict, per-dimension
+    scores, gap, and the model answer. Used both live (latest question under
+    the chat) and in the final per-question review (voice-page parity)."""
+    glyph = _VERDICT_GLYPH.get((entry.get("verdict") or "").lower(), "•")
+    chips = " · ".join(f"{k.title()} {v}" for k, v in entry["scores"].items())
+    gap = (entry.get("justifications") or "").strip()
+    parts = [f"**{glyph} {entry.get('section_title', 'Question')} — "
+             f"{entry.get('verdict', 'scored')}** · {chips}"]
+    if gap:
+        parts.append(f"*Gap: {gap[:300]}*")
+    if entry.get("model_answer"):
+        parts.append(f"**Model answer:** {entry['model_answer']}")
+    return "\n\n".join(parts)
 
 
 st.set_page_config(page_title="AI Mock Interviewer", page_icon="🎤", layout="wide")
@@ -125,6 +181,7 @@ if start_clicked:
             "thread": None,
             "session": None,
             "candidate": None,
+            "reviewer": None,
             "summary": None,
             "error": None,
         }
@@ -143,29 +200,74 @@ for turn in turns:
     with messages.chat_message("assistant" if role == "interviewer" else "user"):
         st.markdown(text)
 
+# Voice-parity per-question feedback: the judge's verdict + model answer ride
+# on session.scores as each question completes (brain.py score ledger), but
+# unlike the voice page the text UI never rendered them until the final
+# summary. While the interview runs, show the latest scored question in a
+# card below the chat — the same feedback the voice page shows before
+# Retake/Next.
+if running and ctx.get("session") and ctx["session"].scores:
+    st.markdown("---")
+    st.markdown(_feedback_text(ctx["session"].scores[-1]))
+
 if ctx.get("error"):
     st.error(ctx["error"])
     st.stop()
 
-if running:
-    if not ctx.get("thread"):
-        # First tick: build the candidate + session, then spawn the worker.
-        ctx["candidate"] = QueueCandidate(ctx["requests"], ctx["responses"])
-        ctx["session"] = Session(session_id=ctx["session_id"], tenant_id="default",
-                                 domain=ctx["domain"])
-        ctx["thread"] = threading.Thread(target=_run_interview, args=(ctx,), daemon=True)
-        ctx["thread"].start()
-        st.rerun()
+# Spawn the worker on the tick where the interview is configured but no
+# thread exists yet. (This MUST NOT be gated on ``running``: on that first
+# tick the thread is None so ``running`` is false — gating here left the
+# worker unstarted and every interview "ended without a summary" instantly.)
+if ctx.get("thread") is None:
+    ctx["candidate"] = QueueCandidate(ctx["requests"], ctx["responses"])
+    ctx["reviewer"] = QueueReviewer(ctx["requests"], ctx["responses"])
+    ctx["session"] = Session(session_id=ctx["session_id"], tenant_id="default",
+                             domain=ctx["domain"])
+    ctx["thread"] = threading.Thread(target=_run_interview, args=(ctx,),
+                                     daemon=True)
+    ctx["thread"].start()
+    st.rerun()
 
+if ctx["thread"] and ctx["thread"].is_alive():
     st.caption(f"State: `{ctx['session'].state.value}`")
-    if ctx["requests"].qsize() > 0:
+
+    # Peek the newest request the worker is waiting on (entries are removed
+    # once answered, so at most one pending request is live at a time).
+    pending = list(ctx["requests"].queue)
+    last_req = pending[-1] if pending else None
+    waiting_review = (isinstance(last_req, dict)
+                      and last_req.get("type") == "review")
+
+    if waiting_review:
+        # Review gate (voice parity): the feedback card above shows the
+        # judge's verdict + correct answer for the scored question — the
+        # interview pauses here until the candidate chooses.
+        st.caption("Feedback for your answer is above — Retake to answer "
+                   "this question again, or continue to the next question.")
+        col_retake, col_next = st.columns(2)
+        qid = last_req.get("question_id", "")
+        if col_next.button("Next question", type="primary",
+                           key=f"gate-next-{qid}"):
+            ctx["responses"].put("next")
+            ctx["requests"].queue.remove(last_req)
+            st.rerun()
+        if col_retake.button("Retake answer", key=f"gate-retake-{qid}"):
+            ctx["responses"].put("retake")
+            ctx["requests"].queue.remove(last_req)
+            st.rerun()
+        st.stop()
+
+    if last_req is not None:
         # The interviewer is waiting for this turn's answer.
         answer = st.chat_input("Your answer (text)…")
         if answer:
             ctx["responses"].put(answer)
+            ctx["requests"].queue.remove(last_req)
             st.rerun()
     else:
-        st.info("Interviewer is thinking…")
+        st.info("Evaluating your answer / preparing the next step — the judge "
+                "runs on qwen2.5:14b, expect a few seconds up to ~1 minute. "
+                "Feedback appears under the chat as each question is scored.")
         time.sleep(1)
         st.rerun()
     st.stop()
@@ -187,6 +289,9 @@ if summary:
             "Follow-up": "yes" if e.get("followup_asked") else "no",
         } for e in summary["scores"]]
         st.dataframe(rows, use_container_width=True, hide_index=True)
+        st.markdown("**Per-question feedback**")
+        for entry in summary["scores"]:
+            st.markdown(_feedback_text(entry))
     st.caption(f"Session `{summary['session_id']}` · {summary['state']} · "
                f"wall {stats.get('wall_ms', '-')} ms · "
                f"LLM first-token mean {stats.get('llm_first_token_mean_ms', '-')} ms · "

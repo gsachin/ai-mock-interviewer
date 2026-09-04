@@ -13,6 +13,29 @@ of html/javascript/css banks happens on the **next** `start_services.ps1` run
 
 ## 1. ✅ DONE — implemented and verified
 
+### Streamlit text-UI fixes — NEW 2026-09-04 (spawn bug + voice-parity feedback)
+1. **Spawn bug** ("Interview ended without a summary"): the page gated the worker-thread
+   spawn on `running` — **False exactly on the spawn tick** (thread is None) — so the
+   worker never started. Fix: spawn on its own condition (`ctx["thread"] is None`)
+   before the running-state branch (`web/streamlit_app.py`).
+2. **No per-question feedback** ("State: evaluate … no feedback like voice"): the judge's
+   verdict/model-answer already rode on `session.scores` (brain score ledger) but the
+   text page only showed scores in the final table. Fix: voice-parity — a feedback card
+   under the chat shows the latest scored question while the interview runs, and the
+   final screen now has a **Per-question feedback** review (verdict · dimension scores ·
+   gap · model answer, shared `_feedback_text` formatter). The waiting line now explains
+   the judge runs on qwen2.5:14b.
+3. **Review gate (voice parity)**: after every scored answer the interview now PAUSES at
+   a gate showing that answer's feedback (verdict + **correct/model answer** when the
+   answer is wrong) with **Retake answer** / **Next question** buttons — a new
+   `QueueReviewer` decider drives the brain's existing review-gate FSM (90 s no-choice
+   auto-advances, like voice). Pending answer/review markers are removed from the UI
+   queue when consumed, so flows can never cross.
+Verified by driving the real page through Streamlit's AppTest runtime against the live
+stack → interview wrapped (2 questions scored), **2/2 questions passed through the gate**
+(buttons + model-answer card asserted at each), final review carries the model answers.
+Regression test: `tests/test_streamlit_ui_live.py` (`@pytest.mark.live`) → **1 passed**.
+
 ### Phase 4: Dynamic skill registration + Skill Update page — NEW 2026-09-04
 Implemented per `docs/TRD_PHASE4_DYNAMIC_SKILL_REGISTRATION.md`; **121 unit
 tests green** (root, `-m "not live"`) + **136 passed** (enterprise-rag-core,

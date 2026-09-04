@@ -79,6 +79,115 @@ def test_retrieve_context_parses_chunk_payload(monkeypatch):
     assert result.chunks[0].score == pytest.approx(0.83)
 
 
+def _patch_mcp_recording(monkeypatch, script, recorded):
+    """_patch_mcp + a session that appends every (tool, args) to ``recorded``."""
+
+    class _RecordingSession(_FakeSession):
+        async def call_tool(self, name, args):
+            recorded.append((name, args))
+            return await super().call_tool(name, args)
+
+    _patch_mcp(monkeypatch, script)
+
+    def fake_session_cls(read, write):
+        return _RecordingSession(script)
+
+    monkeypatch.setattr("interviewer.rag_client.ClientSession", fake_session_cls)
+
+
+def test_register_bank_forwards_args_and_parses_payload(monkeypatch):
+    payload = {
+        "doc_id": "bank-html", "tenant_id": "default",
+        "sections": 15, "chunks": 15, "status": "registered",
+    }
+    recorded = []
+    _patch_mcp_recording(monkeypatch, {"register_bank": json.dumps(payload)},
+                         recorded)
+
+    client = RagClient(token="tok")
+    result = asyncio.run(client.register_bank(
+        "bank-html", "# HTML\n\n## Semantic HTML\n\nbody", "html"))
+
+    assert recorded == [("register_bank", {
+        "markdown": "# HTML\n\n## Semantic HTML\n\nbody",
+        "doc_id": "bank-html",
+        "department": "html",
+        "force": False,
+    })]
+    assert result.status == "registered"
+    assert result.sections == 15 and result.chunks == 15
+    assert result.doc_id == "bank-html" and result.tenant_id == "default"
+
+
+def test_register_bank_force_flag_and_error_mapping(monkeypatch):
+    payload = {
+        "doc_id": "bank-html", "tenant_id": "default",
+        "sections": 15, "chunks": 15, "status": "registered",
+    }
+    recorded = []
+    _patch_mcp_recording(monkeypatch, {"register_bank": json.dumps(payload)},
+                         recorded)
+    client = RagClient(token="tok")
+    asyncio.run(client.register_bank("bank-html", "md", "html", force=True))
+    assert recorded[0][1]["force"] is True
+
+    # error results surface as RuntimeError (the SDK's is_error contract)
+    class _ErrContent:
+        text = "MCP tool register_bank failed: unknown question in bank"
+
+    class _ErrResult:
+        content = [_ErrContent]
+        is_error = True
+
+    class _ErrSession(_FakeSession):
+        async def call_tool(self, name, args):
+            self.calls.append((name, args))
+            return _ErrResult()
+
+    def fake_session_cls(read, write):
+        return _ErrSession({})
+
+    monkeypatch.setattr("interviewer.rag_client.ClientSession", fake_session_cls)
+    with pytest.raises(RuntimeError, match="register_bank failed"):
+        asyncio.run(client.register_bank("bank-html", "md", "html"))
+
+
+def test_register_bank_uses_long_timeout_budget(monkeypatch):
+    """Server-side embedding of a bank needs more than the 30 s default."""
+    from contextlib import asynccontextmanager
+
+    payload = {
+        "doc_id": "bank-html", "tenant_id": "default",
+        "sections": 15, "chunks": 15, "status": "registered",
+    }
+    seen_timeouts = []
+
+    @asynccontextmanager
+    async def fake_streamable(url, http_client=None):
+        seen_timeouts.append(float(http_client.timeout.connect))
+        yield None, None
+
+    monkeypatch.setattr("interviewer.rag_client.streamable_http_client",
+                        fake_streamable)
+
+    def fake_session_cls(read, write):
+        return _FakeSession({"register_bank": json.dumps(payload)})
+
+    monkeypatch.setattr("interviewer.rag_client.ClientSession", fake_session_cls)
+    asyncio.run(RagClient(token="tok").register_bank("bank-html", "md", "html"))
+    assert seen_timeouts == [120.0]
+
+    # a plain read call keeps the default 30 s budget
+    seen_timeouts.clear()
+    monkeypatch.setattr("interviewer.rag_client.ClientSession",
+                        lambda read, write: _FakeSession(
+                            {"retrieve_context": json.dumps({
+                                "chunks": [], "count": 0,
+                                "hit_source": "retrieval"})}))
+    asyncio.run(RagClient(token="tok").retrieve_context("x", top_k=3))
+    assert seen_timeouts == [30.0]
+
+
 def test_agent_context_forwards_request_shape(monkeypatch):
     payload = {
         "status": "SUCCESS",

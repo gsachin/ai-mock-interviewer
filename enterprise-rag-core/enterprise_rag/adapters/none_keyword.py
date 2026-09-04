@@ -10,3 +10,6 @@ class NoOpKeywordStore:
 
     async def upsert(self, records: list[UpsertRecord]) -> None:
         return None
+
+    async def delete_by_parent(self, parent_id: str, tenant_id: str) -> int:
+        return 0

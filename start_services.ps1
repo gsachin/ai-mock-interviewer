@@ -45,6 +45,9 @@
     and the interviewer agent worker. The voice UI served at
     http://127.0.0.1:8010/ then runs a full spoken interview
     (faster-whisper STT + kokoro TTS + the fast voice LLM llama3.2:3b).
+    With -WithVoice -WithTunnel the launcher ALSO tunnels LiveKit (:7880)
+    and restarts the management plane so /voice/token hands remote pages the
+    public wss URL -- the demo becomes shareable over the internet.
 .EXAMPLE
     .\start_services.ps1
     .\start_services.ps1 -WithStreamlit
@@ -97,6 +100,9 @@ $LiveKitServer = Join-Path $ProjectRoot ".tools\livekit\livekit-server.exe"
 $LiveKitLog    = Join-Path $env:TEMP "livekit_server.log"
 $VoiceWorkerLog = Join-Path $env:TEMP "voice_worker.log"
 $VoiceLLMModel = "llama3.2:3b"
+# Voice sharing over the internet (-WithVoice -WithTunnel): cached public
+# hostname of the LiveKit quick tunnel (git-ignored, like the page tunnel).
+$LiveKitTunnelFile = Join-Path $ProjectRoot ".tunnel_livekit"
 
 # Ports the launcher owns (Streamlit only joins when requested).
 $LaunchPorts = @($Port, $RagPort)
@@ -470,21 +476,31 @@ if ($SkipRag) {
 } else {
     $forceArg = @()
     if ($ForcePrepopulate) { $forceArg = @("--force") }
-    foreach ($domain in @("system-design", "ios", "dsa", "devops")) {
-        $kb = Join-Path $ProjectRoot ("question_banks\{0}.md" -f $domain)
-        if (-not (Test-Path $kb)) {
-            Write-Warn ("Bank file not found: {0} -- skipping" -f $kb)
+    # Phase 4 (dynamic skills): scan the WHOLE question_banks folder — every
+    # *.md names a skill (doc-id bank-<name>, department <name>). The slug
+    # check protects that naming contract; prepopulate is idempotent, so
+    # banks that are already registered skip automatically ("already added").
+    $bankDir = Join-Path $ProjectRoot "question_banks"
+    $bankFiles = Get-ChildItem $bankDir -Filter *.md -File `
+        -ErrorAction SilentlyContinue | Sort-Object Name
+    if (-not $bankFiles) {
+        Write-Warn ("No question banks found under {0}" -f $bankDir)
+    }
+    foreach ($bankFile in $bankFiles) {
+        $name = $bankFile.BaseName.ToLower()
+        if ($name -notmatch '^[a-z0-9][a-z0-9-]*$' -or $name.EndsWith("-")) {
+            Write-Warn ("Skipping {0}: file name cannot be a skill -- use lowercase letters, digits and dashes" -f $bankFile.Name)
             continue
         }
-        Write-OK ("Prepopulating {0} (doc-id bank-{1}, department {1}) ..." -f $domain, $domain)
+        Write-OK ("Prepopulating {0} (doc-id bank-{1}, department {1}) ..." -f $name, $name)
         & $ERCPython -m enterprise_rag.prepopulate `
-            --kb $kb `
-            --doc-id ("bank-{0}" -f $domain) `
+            --kb $bankFile.FullName `
+            --doc-id ("bank-{0}" -f $name) `
             --tenant "default" `
-            --department $domain `
+            --department $name `
             @forceArg 2>&1 | Out-Host
         if ($LASTEXITCODE -ne 0) {
-            Write-Warn ("Prepopulate failed for {0} (exit {1}) -- Ollama embeddings must be up" -f $domain, $LASTEXITCODE)
+            Write-Warn ("Prepopulate failed for {0} (exit {1}) -- Ollama embeddings must be up" -f $name, $LASTEXITCODE)
         } else {
             $banksPrepopulated = $true
         }
@@ -784,6 +800,90 @@ if ($WithVoice) {
     Write-Warn "Dev caveat: livekit-server (dev mode) drops a worker that idles ~20s; if a session fails to join, re-run with -WithVoice to restart the pair."
 }
 
+# ==== Step 8e: Voice sharing over the internet (-WithVoice -WithTunnel) ====
+# The -WithTunnel step above tunnels the web page, but a REMOTE browser also
+# needs to reach LiveKit -- without it /voice/token would point the page at
+# http://127.0.0.1:7880 and voice can never work off-machine. When both
+# switches are requested we (a) quick-tunnel LiveKit, (b) restart the
+# management plane so its token endpoint advertises the PUBLIC wss URL.
+# Purely additive: never runs unless -WithVoice AND -WithTunnel are set.
+$LiveKitTunnelHost = $null
+if ($WithTunnel -and $WithVoice -and $LiveKitProcess) {
+    Write-Step "Step 8e: Cloudflare tunnel for LiveKit ($LiveKitPort) + shareable voice demo"
+
+    $cloudflaredPath = Find-CloudflaredExe
+    if (-not $cloudflaredPath) {
+        Write-Err "cloudflared not found! Install with: winget install Cloudflare.cloudflared"
+        Write-Err "Voice sharing over the internet is skipped -- the local demo is unchanged."
+    } else {
+        Write-OK ("cloudflared: {0}" -f $cloudflaredPath)
+
+        # The page tunnel (Step 8c) is reused when it came up; otherwise start
+        # it here so the shareable URL always prints.
+        if (-not $TunnelHost) {
+            $TunnelHost = Start-QuickTunnel -Exe $cloudflaredPath -TunPort $Port `
+                -Label "Interviewer" `
+                -CacheFile $TunnelFile `
+                -LogBase "interviewer_tunnel"
+        }
+
+        # LiveKit speaks WebSocket over HTTP -- a quick tunnel proxies it
+        # (signaling + the interviewer's data events).
+        $LiveKitTunnelHost = Start-QuickTunnel -Exe $cloudflaredPath `
+            -TunPort $LiveKitPort `
+            -Label "LiveKit" `
+            -CacheFile $LiveKitTunnelFile `
+            -LogBase "livekit_tunnel"
+
+        if ($LiveKitTunnelHost) {
+            $wssUrl = "wss://$LiveKitTunnelHost"
+            Write-OK ("LiveKit public URL: {0}" -f $wssUrl)
+
+            # The management plane reads LIVEKIT_URL at import time, and it
+            # started in Step 7 before any tunnel existed. Restart it with the
+            # public URL so /voice/token answers remote pages correctly.
+            # Nothing has joined yet at boot -- the registry is empty.
+            Write-Warn "Restarting the management plane so /voice/token advertises $wssUrl ..."
+            if ($InterviewerProcess) {
+                Stop-Process -Id $InterviewerProcess.Id -Force -ErrorAction SilentlyContinue
+            }
+            for ($w = 0; $w -lt 10; $w++) {
+                Start-Sleep -Seconds 1
+                if (-not (Get-NetTCPConnection -LocalPort $Port -ErrorAction SilentlyContinue)) { break }
+            }
+            $oldLkUrl = $env:LIVEKIT_URL
+            $env:LIVEKIT_URL = $wssUrl
+            foreach ($f in @($ServerLog, $ServerErr)) {
+                if (Test-Path $f) { Remove-Item $f -Force -ErrorAction SilentlyContinue }
+            }
+            $InterviewerProcess = Start-Process @serverArgs
+            Write-OK ("Interviewer server restarted (PID {0}) with the public LiveKit URL" -f $InterviewerProcess.Id)
+            $env:LIVEKIT_URL = $oldLkUrl   # restore: later processes stay local
+
+            $attempt = 0
+            $serverReady2 = $false
+            while (-not $serverReady2 -and $attempt -lt 30) {
+                Start-Sleep -Seconds 2
+                $attempt++
+                if ((curl.exe -s -o NUL -w "%{http_code}" $HealthUrl 2>$null) -eq "200") {
+                    Write-OK ("Restarted interviewer server responding (took ~{0}s)" -f ($attempt * 2))
+                    $serverReady2 = $true
+                } else {
+                    Write-Warn ("Waiting for restarted interviewer server... ({0}/30)" -f $attempt)
+                }
+            }
+            if (-not $serverReady2) {
+                Write-Err "Restarted interviewer server did NOT come up - check the logs below."
+                Write-Err "Re-run WITHOUT -WithVoice -WithTunnel to return to the fully local demo."
+            } else {
+                Write-OK "Management plane restarted -- remote pages now reach LiveKit through the tunnel."
+            }
+        } else {
+            Write-Warn "LiveKit tunnel did not start -- audio stays local-only (the page tunnel above still works)."
+        }
+    }
+}
+
 # ==== Step 9: Summary =====================================================
 Write-Host ""
 Write-Host ("{0}{1}AI MOCK INTERVIEWER STARTED{2}" -f $GREEN, $BOLD, $RESET)
@@ -810,8 +910,19 @@ if ($WebProcess) {
 if ($TunnelHost) {
     Write-Host ("{0}Public tunnel:{1}      {0}https://{2}{1}" -f $CYAN, $RESET, $TunnelHost)
 }
+if ($LiveKitTunnelHost) {
+    Write-Host ("{0}LiveKit tunnel:{1}      {0}wss://{2}{1}" -f $CYAN, $RESET, $LiveKitTunnelHost)
+}
 if ($StreamlitTunnelHost) {
     Write-Host ("{0}Streamlit tunnel:{1}   {0}https://{2}{1}" -f $CYAN, $RESET, $StreamlitTunnelHost)
+}
+if ($TunnelHost -and $LiveKitTunnelHost) {
+    Write-Host ""
+    Write-Host ("{0}{1}SHAREABLE VOICE DEMO:{2}   {0}https://{3}/{2}" -f $GREEN, $BOLD, $RESET, $TunnelHost)
+    Write-Host ("{0}  /voice/token hands remote pages the public LiveKit URL (wss://{1}).{2}" -f $CYAN, $RESET, $LiveKitTunnelHost)
+    Write-Host ("{0}  Audio reaches REMOTE browsers only when WebRTC media is reachable: works for{2}" -f $YELLOW, $RESET)
+    Write-Host ("{0}  same-network/LAN viewers and your own devices; for public-internet audio deploy{2}" -f $YELLOW, $RESET)
+    Write-Host ("{0}  LiveKit Cloud or a TURN server (docs/DONE_AND_PENDING.md P5).{2}" -f $YELLOW, $RESET)
 }
 Write-Host ""
 Write-Host ("{0}Text-mode interview (proves LLM + RAG + FSM end-to-end):{1}" -f $BOLD, $RESET)
@@ -829,6 +940,9 @@ if ($WebProcess) { Write-Host ("   Web:          {0}" -f $WebLog) }
 if ($StreamlitProcess) { Write-Host ("   Streamlit:    {0}" -f $StreamlitLog) }
 Write-Host ""
 Write-Host ("{0}Stop:{1} taskkill /F /IM python.exe /FI ""PID NE $PID""  (or Ctrl+C in this console then re-run to restart)" -f $YELLOW, $RESET)
+if ($TunnelHost -or $StreamlitTunnelHost -or $LiveKitTunnelHost) {
+    Write-Host ("{0}Stop tunnels:{1} taskkill /F /IM cloudflared.exe  (kills every cloudflared quick tunnel on this machine){2}" -f $YELLOW, $RESET)
+}
 Write-Host ("{0}Re-run: .\start_services.ps1{1}" -f $CYAN, $RESET)
 Write-Host ""
 

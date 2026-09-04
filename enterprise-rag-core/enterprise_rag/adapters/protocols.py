@@ -53,6 +53,12 @@ class KeywordStore(Protocol):
 
     async def upsert(self, records: list[UpsertRecord]) -> None: ...
 
+    async def delete_by_parent(self, parent_id: str, tenant_id: str) -> int:
+        """Delete all chunks belonging to a parent; returns the count removed.
+        Needed so an in-process force rebuild cannot leave superseded rows in
+        the (in-memory) sparse leg."""
+        ...
+
 
 class SemanticCache(Protocol):
     """Tenant-scoped vector-distance semantic cache."""

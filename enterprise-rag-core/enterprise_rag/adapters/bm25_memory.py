@@ -48,6 +48,15 @@ class BM25KeywordStore:
         self._chunks = list(by_id.values())
         await asyncio.to_thread(self._rebuild)
 
+    async def delete_by_parent(self, parent_id: str, tenant_id: str) -> int:
+        kept = [c for c in self._chunks
+                if not (c.parent_id == parent_id and c.tenant_id == tenant_id)]
+        removed = len(self._chunks) - len(kept)
+        if removed:
+            self._chunks = kept
+            await asyncio.to_thread(self._rebuild)
+        return removed
+
     # ── scoring ──────────────────────────────────────────────────────────
 
     def _score(self, query: str, limit_hint: int) -> list[tuple[float, Chunk]]:

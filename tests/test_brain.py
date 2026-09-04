@@ -3,7 +3,10 @@ per-hop latency logging, and the no-follow-up fast path. Stub RAG + stub LLM
 (the real services are exercised by the live gate)."""
 import asyncio
 
-from interviewer.brain import LLMInterviewer
+import pytest
+
+from interviewer.brain import EmptyBankError, LLMInterviewer
+from interviewer.rag_client import InterviewBankResult
 from interviewer.state_machine import InterviewerState, Session
 from interviewer.voice.stubs import StubLLM
 from tests.test_interview import StubRag
@@ -34,6 +37,31 @@ ANSWERS = {
 
 def run(coro):
     return asyncio.run(coro)
+
+
+class _EmptyBankRag(StubRag):
+    """StubRag whose bank has no questions (bank-<doc> not registered)."""
+
+    async def interview_bank(self, doc_id):
+        self.bank_calls.append(doc_id)
+        return InterviewBankResult(doc_id=doc_id, tenant_id="default",
+                                   questions=[], count=0)
+
+
+def test_run_fails_fast_on_empty_bank():
+    rag = _EmptyBankRag()
+    llm = StubLLM(["Welcome to your system design interview."])
+    interviewer = LLMInterviewer(rag, llm, Session(
+        session_id="s-empty", tenant_id="default", domain="system-design"))
+
+    with pytest.raises(EmptyBankError, match="no questions registered"):
+        run(interviewer.run("bank-unknown", answers={"s1": "anything"}))
+
+    # no question turn or score was produced — the interview cannot silently
+    # "succeed" with zero questions
+    session = interviewer._session
+    assert all(t.role != "candidate" for t in session.turns)
+    assert session.scores == []
 
 
 def test_full_interview_with_followup_round():

@@ -79,7 +79,7 @@ The voice identity is per-deployment config, not per-user audio; see
 | MCP client for the RAG service | `interviewer/rag_client.py` |
 | Interviewer state machine (Phase 2) | `interviewer/state_machine.py` |
 | Scripted text-mode interview loop (Phase 1 gate) | `interviewer/interview.py` |
-| Domain question banks (16 questions, real content) | `question_banks/` + `scripts/prepopulate_banks.sh` |
+| Domain question banks (one `## ` per question; 7 banks as of 2026-09-04) | `question_banks/` + auto-registration (`start_services.ps1` Step 5, `scripts/prepopulate_banks.sh`, Skill Update page) |
 | Voice-optimized prompt templates | `interviewer/prompts.py` |
 | STT/TTS/LLM engine protocols + text-mode stubs | `interviewer/voice/` |
 | LiveKit agent worker skeleton (Phase 3) | `interviewer/voice/agent.py` |
@@ -89,9 +89,14 @@ The voice identity is per-deployment config, not per-user audio; see
 ## Phase 1: scripted interview over MCP
 
 ```bash
-scripts/prepopulate_banks.sh               # ingest the 4 domain banks (idempotent)
+scripts/prepopulate_banks.sh               # ingest every question_banks/*.md (idempotent — new banks auto-register)
 RAG_MCP_URL=http://127.0.0.1:8031/mcp python -m pytest tests/ -m live
 ```
+
+New skills need no script edits: drop a `.md` bank into `question_banks/` and
+it registers on the next start, or upload it on the **Skill Update** page
+(`http://127.0.0.1:8010/skills.html`) while services run — see
+`docs/TRD_PHASE4_DYNAMIC_SKILL_REGISTRATION.md`.
 
 `ScriptedInterview` walks the full FSM over the RAG service: question bank
 catalog → exact question fetch → candidate answer → cache-gated rubric

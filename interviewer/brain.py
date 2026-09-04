@@ -86,6 +86,12 @@ class _EmptyFollowups:
     chunks: list = []
 
 
+class EmptyBankError(RuntimeError):
+    """Raised when a doc id has no registered question bank — the interview
+    cannot start. Typed so the UIs can show a friendly, actionable message
+    instead of a silent zero-question interview or a generic error."""
+
+
 def rubric_context(rubric: dict[str, Any], followups: Any) -> str:
     """Evaluation context: the core's U-shape envelope plus domain follow-up
     chunks, capped so the judge prompt stays lean."""
@@ -100,16 +106,17 @@ def rubric_context(rubric: dict[str, Any], followups: Any) -> str:
 
 
 # RCA fix (2026-09-03): the page-facing phase protocol. Every backend phase
-# emits a ``state`` event whose label the page shows as a spinner — the
-# student always sees *something* between spoken turns.
+# emits a ``state`` event whose label the page shows as an activity line —
+# the student always sees *something* between spoken turns. Labels are plain
+# typography (no emoji glyphs — the UI renders icons as graphics, not text).
 PHASE_LABELS: dict[str, str] = {
-    "speaking": "Interviewer speaking…",
-    "listening": "🎙 Listening — please answer aloud…",
-    "transcribing": "⏳ Transcribing your answer…",
-    "evaluating": "⏳ Evaluating your answer…",
-    "scoring": "⏳ Recording your score…",
+    "speaking": "Interviewer speaking",
+    "listening": "Listening — please answer aloud",
+    "transcribing": "Transcribing your answer",
+    "evaluating": "Evaluating your answer",
+    "scoring": "Recording your score",
     "review": "Answer scored — retake it or move to the next question",
-    "wrap": "⏳ Preparing your feedback…",
+    "wrap": "Preparing your feedback",
 }
 
 
@@ -304,6 +311,11 @@ class LLMInterviewer:
         s.transition(InterviewerEvent.GREETED)
 
         bank = await self._rag.interview_bank(doc_id)
+        if not bank.questions:
+            raise EmptyBankError(
+                f"no questions registered for '{doc_id}' — register the skill "
+                "on the Skill Update page, or restart services to "
+                "auto-register the question_banks folder")
         for i, ref in enumerate(bank.questions[:self._max_questions]):
             if i > 0:
                 s.transition(InterviewerEvent.MORE_QUESTIONS)

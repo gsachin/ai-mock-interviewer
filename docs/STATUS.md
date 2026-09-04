@@ -1,6 +1,6 @@
 # STATUS — ai-mock-interviewer
 
-**Last updated:** 2026-09-02 · **Voice plan:** `PLAN_VOICE_PHASE3_BROWSER.md` (superseded — implemented)
+**Last updated:** 2026-09-02 (Phase 1–3 launch + numbers) · **Phase 4:** see `docs/STATUS_PHASE4.md` (dynamic skill registration, 2026-09-04) · **Voice plan:** `PLAN_VOICE_PHASE3_BROWSER.md` (superseded — implemented)
 
 ---
 

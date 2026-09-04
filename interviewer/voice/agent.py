@@ -30,9 +30,10 @@ except ImportError as exc:  # pragma: no cover - import-time guard
         "pip install -e '.[voice]'"
     ) from exc
 
-from interviewer.brain import PHASE_LABELS
+from interviewer.brain import EmptyBankError, PHASE_LABELS
 from interviewer.config import InterviewerConfig
 from interviewer.rag_client import RagClient
+from interviewer.skills import discover_local_banks
 from interviewer.state_machine import Session
 from interviewer.voice.interviewer import build_voice_interviewer
 from interviewer.voice.livekit import (
@@ -53,9 +54,14 @@ _MIN_ANSWER_BYTES = int(0.3 * 16000 * 2)  # shorter buffers are not an answer
 
 
 def domain_from_room(room_name: str, default: str = "system-design") -> str:
-    """Rooms are named ``interview-<domain>-<sid>`` by /voice/token."""
+    """Rooms are named ``interview-<domain>-<sid>`` by /voice/token. A room
+    parses to a known domain — the static legacy set or any skill currently
+    in the question_banks folder. The folder is scanned per call (not at
+    import): a skill uploaded to the Skill Update page after this worker
+    booted must be recognized without a worker restart."""
     parts = (room_name or "").split("-")
-    if len(parts) >= 3 and parts[1] in DOMAINS:
+    if len(parts) >= 3 and (parts[1] in DOMAINS
+                            or parts[1] in {b.name for b in discover_local_banks()}):
         return parts[1]
     return default
 
@@ -278,6 +284,12 @@ async def run_agent(ctx: agents.JobContext) -> None:
                      summary["session_id"], summary["state"],
                      summary["stats"]["wall_ms"],
                      summary["stats"]["voice_budget_bar"])
+        except EmptyBankError as exc:
+            # no questions registered for the room's bank — tell the candidate
+            # why instead of a silent zero-question "interview"
+            log.warning("empty bank for room %s: %s", ctx.room.name, exc)
+            await _notice(str(exc))
+            reason = str(exc)
         except Exception:
             log.exception("interviewer run failed")
             reason = "interviewer error — please end the call and try again"

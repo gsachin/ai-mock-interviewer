@@ -23,6 +23,7 @@ dependencies = [
 api = [
     "fastapi>=0.141,<1",
     "uvicorn[standard]>=0.52,<1",
+    "python-multipart>=0.0.18",   # POST /skills multipart upload (Skill Update page)
 ]
 web = [
     "streamlit>=1.40",        # web/streamlit_app.py — interactive text-mode interview UI

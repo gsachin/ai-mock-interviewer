@@ -1,0 +1,359 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>AI Mock Interviewer — Skill Update</title>
+  <style>
+    /* ── design tokens (shared with index.html) ────────────────────── */
+    :root {
+      --bg: #0b0e13;            /* page */
+      --surface-1: #11151d;     /* cards */
+      --surface-2: #171c26;     /* raised / hover */
+      --surface-3: #1e2531;     /* inputs */
+      --border: rgba(148, 163, 184, 0.14);
+      --border-strong: rgba(148, 163, 184, 0.28);
+      --text: #e8ecf3;
+      --text-muted: #9aa6b8;
+      --text-faint: #6b7688;
+      --accent: #3b82f6;
+      --accent-strong: #2f6fe0;
+      --accent-ink: #0b1220;
+      --ok: #34d399;
+      --ok-dim: rgba(52, 211, 153, 0.12);
+      --warn: #fbbf24;
+      --warn-dim: rgba(251, 191, 36, 0.12);
+      --danger: #f87171;
+      --danger-dim: rgba(248, 113, 113, 0.12);
+      --danger-solid: #b91c1c;
+      --radius: 12px;
+      --radius-sm: 8px;
+      --shadow: 0 1px 2px rgba(0,0,0,.4), 0 8px 24px rgba(0,0,0,.25);
+      --font: "Inter", "Segoe UI", system-ui, -apple-system, sans-serif;
+    }
+    * { box-sizing: border-box; }
+    html, body { margin: 0; }
+    body { background: var(--bg); color: var(--text);
+           font-family: var(--font); font-size: 15px; line-height: 1.5;
+           -webkit-font-smoothing: antialiased; }
+    .wrap { max-width: 860px; margin: 0 auto; padding: 28px 20px 64px; }
+
+    /* ── header + nav ─────────────────────────────────────────────── */
+    header { display: flex; align-items: center; justify-content: space-between;
+             gap: 16px; margin-bottom: 22px; flex-wrap: wrap; }
+    .brand { display: flex; align-items: center; gap: 12px; }
+    .brand .mark { width: 40px; height: 40px; border-radius: 10px; flex: none;
+                   display: grid; place-items: center;
+                   background: linear-gradient(160deg, #1c2740, #121a2c);
+                   border: 1px solid var(--border); color: var(--accent); }
+    .brand h1 { margin: 0; font-size: 19px; font-weight: 650; letter-spacing: -0.01em; }
+    .brand .eyebrow { font-size: 11px; letter-spacing: 0.14em; text-transform: uppercase;
+                      color: var(--text-faint); margin: 2px 0 0; }
+    .nav { display: flex; gap: 6px; background: var(--surface-1);
+           border: 1px solid var(--border); border-radius: 999px; padding: 4px; }
+    .nav a { color: var(--text-muted); text-decoration: none; font-size: 13px;
+             font-weight: 600; padding: 6px 14px; border-radius: 999px;
+             white-space: nowrap; }
+    .nav a:hover { color: var(--text); }
+    .nav a.active { background: var(--surface-3); color: var(--text); }
+
+    /* ── cards ────────────────────────────────────────────────────── */
+    .card { background: var(--surface-1); border: 1px solid var(--border);
+            border-radius: var(--radius); box-shadow: var(--shadow); }
+    .card + .card { margin-top: 14px; }
+    .card.pad { padding: 18px; }
+    .card h2 { margin: 0 0 12px; font-size: 12px; font-weight: 650;
+               letter-spacing: 0.1em; text-transform: uppercase;
+               color: var(--text-faint); display: flex; align-items: center;
+               gap: 8px; }
+    .card h2 svg { color: var(--accent); }
+    .card h3 { margin: 0 0 4px; font-size: 15px; font-weight: 600; }
+    .card p.hint { margin: 0 0 14px; font-size: 13.5px; color: var(--text-muted); }
+
+    /* ── controls ─────────────────────────────────────────────────── */
+    .controls { display: flex; align-items: flex-end; gap: 12px; flex-wrap: wrap; }
+    label.field { display: flex; flex-direction: column; gap: 4px;
+                  font-size: 12px; color: var(--text-faint); flex: 1 1 200px; }
+    input[type="file"], input[type="text"] { font-family: var(--font);
+                  font-size: 14px; background: var(--surface-3); color: var(--text);
+                  border: 1px solid var(--border-strong);
+                  border-radius: var(--radius-sm); padding: 10px 12px; width: 100%; }
+    input[type="file"] { cursor: pointer; padding: 8px 12px; }
+    button { font-family: var(--font); font-size: 14px; }
+    button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+    .btn { display: inline-flex; align-items: center; justify-content: center;
+           gap: 9px; border-radius: var(--radius-sm); border: 1px solid transparent;
+           padding: 10px 18px; font-weight: 600; cursor: pointer; transition:
+           background .15s ease, border-color .15s ease, opacity .15s ease;
+           min-height: 42px; }
+    .btn:disabled { opacity: 0.42; cursor: default; }
+    .btn.primary { background: var(--accent); color: #fff; }
+    .btn.primary:hover:not(:disabled) { background: var(--accent-strong); }
+    .btn.subtle { background: var(--surface-2); color: var(--text);
+                  border-color: var(--border-strong); }
+    .btn.subtle:hover:not(:disabled) { background: var(--surface-3); }
+    .btn.warn { background: var(--warn); color: #33260a; }
+    .btn.warn:hover:not(:disabled) { background: #f5b014; }
+    .btn.ghost { background: transparent; color: var(--text-muted);
+                 border-color: var(--border-strong); }
+    .btn.ghost:hover:not(:disabled) { color: var(--text); }
+
+    /* ── status line + badges ─────────────────────────────────────── */
+    #status { min-height: 20px; font-size: 13.5px; color: var(--text-muted);
+              margin: 14px 0 0; }
+    #status.ok { color: var(--ok); }
+    #status.warn { color: var(--warn); }
+    #status.err { color: var(--danger); }
+    .badge { display: inline-flex; align-items: center; gap: 6px; font-size: 12px;
+             font-weight: 650; border-radius: 999px; padding: 4px 12px;
+             border: 1px solid; white-space: nowrap; }
+    .badge.reg { color: var(--ok); background: var(--ok-dim);
+                 border-color: rgba(52,211,153,.35); }
+    .badge.miss { color: var(--warn); background: var(--warn-dim);
+                  border-color: rgba(251,191,36,.35); }
+    .badge.off, .badge.bad { color: var(--danger); background: var(--danger-dim);
+                  border-color: rgba(248,113,113,.35); }
+
+    /* ── skills table ─────────────────────────────────────────────── */
+    .table-wrap { overflow-x: auto; }
+    table { width: 100%; border-collapse: collapse; font-size: 13.5px; }
+    th { text-align: left; font-size: 11.5px; letter-spacing: 0.08em;
+         text-transform: uppercase; color: var(--text-faint); font-weight: 650;
+         padding: 8px 10px; border-bottom: 1px solid var(--border); }
+    td { padding: 11px 10px; border-bottom: 1px solid rgba(148,163,184,0.07);
+         color: var(--text); vertical-align: middle; }
+    td.mono { font-family: ui-monospace, "Cascadia Code", Consolas, monospace;
+              font-size: 12.5px; color: var(--text-muted); }
+    td.dim { color: var(--text-muted); }
+    tr:last-child td { border-bottom: none; }
+    .empty { text-align: center; color: var(--text-faint); padding: 22px; }
+    .hidden { display: none !important; }
+    ::-webkit-scrollbar { width: 10px; }
+    ::-webkit-scrollbar-thumb { background: #262e3b; border-radius: 8px;
+                                border: 2px solid var(--surface-1); }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <header>
+      <div class="brand">
+        <div class="mark" aria-hidden="true">
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+               stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round">
+            <rect x="9" y="2.5" width="6" height="11.5" rx="3"></rect>
+            <path d="M5 11.5a7 7 0 0 0 14 0"></path>
+            <path d="M12 18.5v3"></path><path d="M8 21.5h8"></path>
+          </svg>
+        </div>
+        <div>
+          <h1>AI Mock Interviewer</h1>
+          <p class="eyebrow">Skill Update · question banks</p>
+        </div>
+      </div>
+      <nav class="nav">
+        <a href="/">Voice interview</a>
+        <a href="/skills.html" class="active">Skill Update</a>
+      </nav>
+    </header>
+
+    <section class="card pad" id="uploadCard">
+      <h2>
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+             stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path><path d="M17 8l-5-5-5 5"></path><path d="M12 3v12"></path></svg>
+        Upload a skill
+      </h2>
+      <p class="hint">Upload a question-bank markdown file — one <code>## </code>
+        heading per question, each with the points a good answer should cover.
+        The skill is registered immediately and appears in the interview domain
+        pickers (voice + text). Re-uploading a skill that exists replaces it.</p>
+      <div class="controls">
+        <label class="field" for="fileInput">Question bank (.md)
+          <input type="file" id="fileInput" accept=".md,text/markdown">
+        </label>
+        <label class="field" for="skillName">Skill name
+          <input type="text" id="skillName" placeholder="auto-filled from file name"
+                 spellcheck="false">
+        </label>
+        <button id="uploadBtn" class="btn primary" disabled>Upload &amp; register</button>
+      </div>
+    </section>
+
+    <section class="card pad" id="skillsCard">
+      <h2>
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+             stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"></path><path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"></path></svg>
+        Installed skills
+        <span style="margin-left:auto">
+          <button id="reconcileBtn" class="btn subtle sm" style="min-height:30px;padding:5px 12px;font-size:12.5px">Register missing</button>
+        </span>
+      </h2>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>Skill</th>
+              <th>Question bank</th>
+              <th>Local questions</th>
+              <th>Status</th>
+            </tr>
+          </thead>
+          <tbody id="skillRows">
+            <tr><td colspan="4" class="empty">Loading installed skills…</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p id="ragHint" class="hint hidden"></p>
+    </section>
+
+    <div id="status">Checking the question-banks folder and the RAG service…</div>
+  </div>
+
+  <script>
+    "use strict";
+    const $ = (id) => document.getElementById(id);
+    const fileInput = $("fileInput"), skillName = $("skillName"),
+          uploadBtn = $("uploadBtn"), statusEl = $("status");
+
+    function status(text, kind) {
+      statusEl.textContent = text;
+      statusEl.className = kind || "";
+    }
+
+    function humanize(name) {
+      return name.replace(/-+/g, " ").replace(/\b\w/g, (c) => c.toUpperCase());
+    }
+
+    // On file pick → propose the skill name (slug) derived from the file name.
+    fileInput.addEventListener("change", () => {
+      const f = fileInput.files && fileInput.files[0];
+      skillName.value = f ? f.name.toLowerCase().replace(/\.md$/i, "") : "";
+      uploadBtn.disabled = !f;
+    });
+    skillName.addEventListener("input", () => {
+      const f = fileInput.files && fileInput.files[0];
+      uploadBtn.disabled = !f;
+    });
+
+    async function api(path, opts) {
+      const resp = await fetch(path, opts);
+      let body = null;
+      try { body = await resp.json(); } catch (_) { /* non-JSON error */ }
+      if (!resp.ok) {
+        throw new Error((body && body.detail) || ("HTTP " + resp.status));
+      }
+      return body;
+    }
+
+    const state = { skills: [], ragOk: null };
+
+    function badgeFor(entry) {
+      const reg = entry.registered;
+      const q = entry.questions;
+      if (entry.error) return '<span class="badge bad" title="' +
+        escapeHtml(entry.error) + '">Local problem</span>';
+      if (reg === true) return '<span class="badge reg">Registered' +
+        (q != null ? " · " + q + " questions" : "") + "</span>";
+      if (reg === false) return '<span class="badge miss">Not registered</span>';
+      return '<span class="badge off">RAG offline</span>';
+    }
+
+    function escapeHtml(s) {
+      return String(s).replace(/[&<>"']/g,
+        (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;",
+                  '"': "&quot;", "'": "&#39;" }[c]));
+    }
+
+    async function renderSkills() {
+      const body = await api("/skills");
+      state.skills = body.skills || [];
+      state.ragOk = body.rag_ok !== false;
+      const rows = $("skillRows");
+      if (!state.skills.length) {
+        rows.innerHTML = '<tr><td colspan="4" class="empty">No question banks ' +
+          "found in the question_banks folder.</td></tr>";
+      } else {
+        rows.innerHTML = state.skills.map((s) => (
+          "<tr><td><b>" + escapeHtml(humanize(s.name)) + "</b></td>" +
+          '<td class="mono">' + escapeHtml(s.doc_id) + "</td>" +
+          '<td class="dim">' + (s.sections == null ? "—" : s.sections) + "</td>" +
+          "<td>" + badgeFor(s) + "</td></tr>"
+        )).join("");
+      }
+      const unusable = body.unusable_files || [];
+      $("ragHint").classList.toggle("hidden", !(unusable.length || !state.ragOk));
+      $("ragHint").innerHTML = (!state.ragOk
+          ? "⚠ RAG service unreachable — registration status is unknown until it "
+            + "is back (upload still saves the file locally). "
+          : "") + (unusable.length
+          ? "Ignored file" + (unusable.length > 1 ? "s" : "") + " with a name "
+            + "that cannot be a skill: " + escapeHtml(unusable.join(", ")) + "."
+          : "");
+      status(state.ragOk ? "Loaded." : "Loaded — RAG service offline.",
+             state.ragOk ? "ok" : "warn");
+    }
+
+    async function uploadSkill() {
+      const f = fileInput.files && fileInput.files[0];
+      if (!f) return;
+      const name = (skillName.value || f.name).trim();
+      const existing = state.skills.find((s) => s.name === name.toLowerCase());
+      if (existing && (existing.registered || existing.error)) {
+        const ok = window.confirm(
+          "Skill “" + humanize(name) + "” already exists" +
+          (existing.registered ? " and is registered" : "") +
+          ". Replace it with this file? The RAG question bank will be rebuilt.");
+        if (!ok) return;
+      }
+      uploadBtn.disabled = true;
+      status("Uploading and registering “" + name + "”…");
+      try {
+        const fd = new FormData();
+        fd.append("file", f, name.toLowerCase() + (name.toLowerCase().endsWith(".md") ? "" : ".md"));
+        const body = await api("/skills", { method: "POST", body: fd });
+        const verb = body.replaced ? "replaced" : "registered";
+        status("Skill “" + humanize(body.name) + "” " + verb +
+               " — " + body.sections + " question" +
+               (body.sections === 1 ? "" : "s") + " (" + body.chunks + " chunks).",
+               "ok");
+        fileInput.value = "";
+        skillName.value = "";
+        await renderSkills();
+      } catch (err) {
+        status("Upload failed: " + err.message, "err");
+      } finally {
+        uploadBtn.disabled = !(fileInput.files && fileInput.files[0]);
+      }
+    }
+
+    async function reconcile() {
+      $("reconcileBtn").disabled = true;
+      status("Checking question_banks against the RAG service…");
+      try {
+        const body = await api("/skills/reconcile", { method: "POST" });
+        const parts = [];
+        if (body.registered.length)
+          parts.push("registered " + body.registered.map((r) => humanize(r.name)).join(", "));
+        if (body.already_present.length) parts.push("already registered: " +
+          body.already_present.length + " skill(s)");
+        if (body.errors.length) parts.push(body.errors.length + " error(s)");
+        status(parts.length ? "Reconcile done — " + parts.join("; ") + "." : "Reconcile done — nothing to do.", "ok");
+        await renderSkills();
+      } catch (err) {
+        status("Reconcile failed: " + err.message, "err");
+      } finally {
+        $("reconcileBtn").disabled = false;
+      }
+    }
+
+    uploadBtn.addEventListener("click", uploadSkill);
+    $("reconcileBtn").addEventListener("click", reconcile);
+
+    renderSkills().catch((err) => {
+      $("skillRows").innerHTML =
+        '<tr><td colspan="4" class="empty">Cannot reach the server API: ' +
+        escapeHtml(err.message) + "</td></tr>";
+      status("Skills list unavailable — " + err.message, "err");
+    });
+  </script>
+</body>
+</html>

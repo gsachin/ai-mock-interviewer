@@ -172,3 +172,31 @@ def test_10_concurrent_voice_sessions():
     summaries = run(gather_all())
     assert all(s["state"] == InterviewerState.WRAP.value for s in summaries)
     assert all(s["stats"]["voice_budget"]["turns"] >= 4 for s in summaries)
+
+
+# ── domain parsing (dynamic skill list, Phase 4) ────────────────────────────
+
+def test_domain_from_room_static_domains():
+    from interviewer.voice.agent import domain_from_room
+
+    assert domain_from_room("interview-ios-abc123") == "ios"
+    assert domain_from_room("interview-system-design-sid1") == "system-design"
+    # an unknown room segment falls back to the default (never an exception)
+    assert domain_from_room("interview-unknown-abc123") == "system-design"
+    assert domain_from_room("interview-unknown-abc123", default="ios") == "ios"
+    assert domain_from_room("not-a-room") == "system-design"
+    assert domain_from_room("") == "system-design"
+
+
+def test_domain_from_room_accepts_folder_skills(monkeypatch):
+    """A skill uploaded to the Skill Update page (present in question_banks
+    but not in the static DOMAINS tuple) must resolve without a restart."""
+    from types import SimpleNamespace
+
+    from interviewer.voice import agent as vagent
+
+    monkeypatch.setattr(vagent, "discover_local_banks",
+                        lambda: [SimpleNamespace(name="react")])
+    assert vagent.domain_from_room("interview-react-sid1") == "react"
+    # unknown segments still fall back to the default
+    assert vagent.domain_from_room("interview-nope-sid1") == "system-design"

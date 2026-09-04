@@ -29,9 +29,15 @@ from interviewer.config import InterviewerConfig  # noqa: E402
 from interviewer.llm import LLMConfig, OpenAICompatibleLLM  # noqa: E402
 from interviewer.rag_client import RagClient  # noqa: E402
 from interviewer.session_store import InMemorySessionStore, RedisSessionStore  # noqa: E402
+from interviewer.skills import discover_local_banks  # noqa: E402
 from interviewer.state_machine import Session  # noqa: E402
 
-DOMAINS = ["system-design", "ios", "dsa", "devops"]
+# Original four domains first (fallback + stable order); every skill found in
+# the question_banks folder joins the picker, so a skill registered on the
+# Skill Update page is interviewable here without a restart.
+_STATIC_DOMAINS = ["system-design", "ios", "dsa", "devops"]
+DOMAINS = _STATIC_DOMAINS + sorted(
+    {b.name for b in discover_local_banks()} - set(_STATIC_DOMAINS))
 
 
 class QueueCandidate:

@@ -66,6 +66,14 @@ class InterviewQuestionResult(BaseModel):
         )
 
 
+class RegisterBankResult(BaseModel):
+    doc_id: str
+    tenant_id: str
+    sections: int
+    chunks: int
+    status: str  # "registered" when new, "already_present" on idempotent skip
+
+
 class RagClient:
     """Async client for enterprise-rag-core's MCP endpoint."""
 
@@ -75,16 +83,17 @@ class RagClient:
         self._token = token
 
     @asynccontextmanager
-    async def session(self) -> AsyncIterator[ClientSession]:
+    async def session(self, timeout_s: float = 30.0) -> AsyncIterator[ClientSession]:
         headers = {"Authorization": f"Bearer {self._token}"} if self._token else {}
-        async with httpx.AsyncClient(headers=headers, timeout=30.0) as hc:
+        async with httpx.AsyncClient(headers=headers, timeout=timeout_s) as hc:
             async with streamable_http_client(self._url, http_client=hc) as (read, write):
                 async with ClientSession(read, write) as session:
                     await session.initialize()
                     yield session
 
-    async def _call(self, tool: str, args: dict[str, Any]) -> str:
-        async with self.session() as session:
+    async def _call(self, tool: str, args: dict[str, Any], *,
+                    timeout_s: float = 30.0) -> str:
+        async with self.session(timeout_s=timeout_s) as session:
             result = await session.call_tool(tool, args)
             if result.is_error:
                 raise RuntimeError(f"MCP tool {tool} failed: {result.content}")
@@ -135,3 +144,20 @@ class RagClient:
             "query": query, "domain": domain, "top_k": top_k,
         })
         return RetrieveContextResult.model_validate(json.loads(text))
+
+    async def register_bank(self, doc_id: str, markdown: str,
+                            department: str, *,
+                            force: bool = False) -> RegisterBankResult:
+        """Registers one question bank from markdown content on the RAG
+        service (in-process ingest into both legs — queryable immediately, no
+        service restart). Idempotent: registering an existing doc without
+        ``force`` returns ``status=already_present``. Server-side embedding of
+        a large bank can exceed the 30 s default budget, so this call uses a
+        120 s timeout."""
+        text = await self._call("register_bank", {
+            "markdown": markdown,
+            "doc_id": doc_id,
+            "department": department,
+            "force": force,
+        }, timeout_s=120.0)
+        return RegisterBankResult.model_validate(json.loads(text))

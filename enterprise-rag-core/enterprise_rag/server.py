@@ -21,6 +21,10 @@ from enterprise_rag.security import SecurityContext                          # �
 from enterprise_rag.orchestrator import AgentContextRequest                  # §3
 from enterprise_rag.config import EngineConfig
 from enterprise_rag.interview import Question, group_questions, question_refs
+from enterprise_rag.prepopulate import (                                    # runtime registration
+    PrepopulateResult,
+    register_bank as register_bank_core,
+)
 
 
 class OIDCJWTVerifier(TokenVerifier):
@@ -124,6 +128,28 @@ async def _vector_store() -> object:
             "server not wired — call build_app() (or set server.agent_vector_store)"
         )
     return agent_vector_store
+
+
+# ── Stack seam ──────────────────────────────────────────────────────────────
+# Wired by build_app() alongside the other seams (replaced in tests). Runtime
+# registration (register_bank) ingests through the full stack — vector store,
+# keyword store, and embedding client — inside the serving process so a new
+# bank is queryable on BOTH legs without a service restart.
+
+agent_stack = None
+
+
+def _set_stack(stack) -> None:
+    global agent_stack
+    agent_stack = stack
+
+
+async def _stack() -> object:
+    if agent_stack is None:
+        raise RuntimeError(
+            "server not wired — call build_app() (or set server.agent_stack)"
+        )
+    return agent_stack
 
 
 # ── Tool: OIDC mode ───────────────────────────────────────────────────────
@@ -284,6 +310,49 @@ async def interview_followup(
     return json.dumps(_chunks_payload(chunks), indent=2)
 
 
+# ── Tool: register_bank (OIDC mode) ─────────────────────────────────────────
+
+def _registration_payload(result: PrepopulateResult) -> dict:
+    return {
+        "doc_id": result.doc_id,
+        "tenant_id": result.tenant_id,
+        "sections": result.sections,
+        "chunks": result.chunks,
+        "status": "already_present" if result.skipped else "registered",
+    }
+
+
+async def register_bank(
+    markdown: str,
+    doc_id: str,
+    department: str,
+    force: bool = False,
+    ctx: Context | None = None,     # SDK-injected; excluded from the input schema
+) -> str:
+    """Registers one interview question bank from markdown content (one ``## ``
+    section = one question). Ingests in-process into both legs — the bank is
+    queryable immediately, no service restart. Idempotent (skips when the doc
+    exists); ``force`` replaces it. Requires OAuth2 bearer token with the
+    rag:write scope."""
+    token = get_access_token()
+    if token is None:
+        raise ValueError("unauthenticated: this tool requires an OAuth2 bearer access token")
+    if "rag:write" not in (token.scopes or []):
+        raise ValueError("insufficient scope: register_bank requires the rag:write scope")
+    security = security_from_token(token)
+    tenant_id = security.tenant_id
+    if not tenant_id:
+        raise ValueError("token has no tenant_id claim — cannot register a bank")
+    if security.departments and department not in security.departments:
+        raise ValueError(
+            f"department {department!r} is outside the token's departments")
+    result = await register_bank_core(
+        await _stack(), markdown=markdown, doc_id=doc_id, department=department,
+        tenant_id=tenant_id, force=force,
+    )
+    return json.dumps(_registration_payload(result), indent=2)
+
+
 # ── Tool: generic retrieval (none auth mode) ───────────────────────────────
 
 def _make_none_auth_retrieve_tool(config: EngineConfig):
@@ -363,6 +432,34 @@ def _make_none_auth_interview_tools(config: EngineConfig):
             interview_followup_defaults)
 
 
+# ── Tool: register_bank (none auth mode) ───────────────────────────────────
+
+def _make_none_auth_register_bank_tool(config: EngineConfig):
+    """Tool variant for ``none`` auth mode: no bearer token, every request
+    runs as the configured default tenant. Same input schema as the OIDC
+    tool."""
+
+    async def register_bank_defaults(
+        markdown: str,
+        doc_id: str,
+        department: str,
+        force: bool = False,
+        ctx: Context | None = None,
+    ) -> str:
+        """Registers one interview question bank from markdown content
+        (one ``## `` section = one question), ingestible on both legs without
+        a service restart. No-auth mode: runs as the configured default
+        tenant."""
+        result = await register_bank_core(
+            await _stack(), markdown=markdown, doc_id=doc_id,
+            department=department, tenant_id=config.default_tenant,
+            force=force,
+        )
+        return json.dumps(_registration_payload(result), indent=2)
+
+    return register_bank_defaults
+
+
 # ── Tool: none auth mode ──────────────────────────────────────────────────
 
 def _make_none_auth_tool(config: EngineConfig):
@@ -426,6 +523,7 @@ def build_mcp(config: EngineConfig | None = None) -> MCPServer:
         mcp.add_tool(interview_bank)
         mcp.add_tool(interview_question)
         mcp.add_tool(interview_followup)
+        mcp.add_tool(register_bank)
     else:
         mcp = MCPServer(name="enterprise-rag-core")
         mcp.add_tool(_make_none_auth_tool(config), name="execute_agent_context")
@@ -434,6 +532,8 @@ def build_mcp(config: EngineConfig | None = None) -> MCPServer:
         mcp.add_tool(bank, name="interview_bank")
         mcp.add_tool(question, name="interview_question")
         mcp.add_tool(followup, name="interview_followup")
+        mcp.add_tool(_make_none_auth_register_bank_tool(config),
+                     name="register_bank")
     return mcp
 
 
@@ -447,6 +547,7 @@ def build_app(config: EngineConfig | None = None):
     _set_orchestrator(stack.orchestrator)
     _set_engine(stack.engine)
     _set_vector_store(stack.vector_store)
+    _set_stack(stack)
     mcp = build_mcp(config)
     app = mcp.streamable_http_app(streamable_http_path="/mcp")
     app.state.stack = stack

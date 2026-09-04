@@ -1,14 +1,38 @@
 # DONE & PENDING — ai-mock-interviewer (voice phase)
 
-**Date:** 2026-09-03 (evening) · **Status:** RCA fixes (T1–T8) **done**; **manual
-answer toggle + Retake/Next review gate implemented + verified**; manual
-browser-with-mic check still **pending** (owner: user, after app testing)
-**Read also:** `docs/STATUS.md` (launch + numbers) · `docs/RCA_VOICE_BROWSER_INTERVIEW.md`
+**Date:** 2026-09-04 · **Status:** Phase 4 (dynamic skill registration + Skill
+Update page) **implemented + unit-verified**; manual browser-with-mic check
+still **pending** (owner: user, after app testing); live launcher registration
+of html/javascript/css banks happens on the **next** `start_services.ps1` run
+**Read also:** `docs/TRD_PHASE4_DYNAMIC_SKILL_REGISTRATION.md` (Phase 4) ·
+`docs/STATUS_PHASE4.md` (Phase 4 done/pending trace of the original intent) ·
+`docs/STATUS.md` (launch + numbers) · `docs/RCA_VOICE_BROWSER_INTERVIEW.md`
 (fix plan — all T tasks now DONE per §8 status block)
 
 ---
 
 ## 1. ✅ DONE — implemented and verified
+
+### Phase 4: Dynamic skill registration + Skill Update page — NEW 2026-09-04
+Implemented per `docs/TRD_PHASE4_DYNAMIC_SKILL_REGISTRATION.md`; **121 unit
+tests green** (root, `-m "not live"`) + **136 passed** (enterprise-rag-core,
+incl. 12 new `register_bank` tests).
+
+| Piece | Behavior | Where |
+|---|---|---|
+| Auto-register at start | Launcher Step 5 + `prepopulate_banks.sh` glob `question_banks/*.md` (slug check); prepopulate's idempotent skip = "already added" → **html/javascript/css register on the next start** (~15 sections each), reruns skip | `start_services.ps1`, `scripts/prepopulate_banks.sh` |
+| Live registration tool | New RAG MCP `register_bank` ingests a bank in-process into BOTH legs (vector + in-memory BM25) — queryable **without a RAG restart**; force-replace deletes both legs (`KeywordStore.delete_by_parent` added to BM25/ES/NoOp) | `enterprise-rag-core/…/prepopulate.py`, `server.py`, `adapters/*` |
+| Skills API | `GET /skills` (folder + live RAG status, RAG-down tolerant), `POST /skills` (upload → validate → save `.md` → register; existing skill = replace), `POST /skills/reconcile` (register missing, probe-first) — all before the static mount | `interviewer/server.py` |
+| Skill Update page | `web/skills.html` at `/skills.html`: status table (Registered · N questions / Not registered / RAG offline / Local problem), upload card with Replace-confirm, Register missing button | `web/skills.html` (new), nav + dynamic domain select in `web/index.html` |
+| Dynamic domain lists | Streamlit + voice room parser: static four domains ∪ `question_banks` scan (per call in the worker) — a skill uploaded mid-run works without restarts; unknown rooms still fall back to `system-design` | `web/streamlit_app.py`, `interviewer/voice/agent.py` |
+| Empty-bank fail-fast | `interview_bank` with 0 questions → typed `EmptyBankError` (no silent zero-question interview); Streamlit error path + voice `notice`/`ended {reason}` explain how to register | `interviewer/brain.py`, `voice/agent.py` |
+
+### Verified 2026-09-04
+- `.venv\Scripts\python.exe -m pytest tests/ -m "not live"` → **121 passed, 5 deselected** (+36 new: `test_skills.py` 27, `test_skills_api.py` 10, rag_client/brain/voice additions).
+- ERC `.\.venv\Scripts\python.exe -m pytest tests/` → **136 passed, 2 skipped** (+12 in `test_register_bank.py`).
+- `node --check` both pages' inline JS; PowerShell/bash syntax checks on both launchers.
+- **Live gate PASSED (real stack, 2026-09-04):** ERC `serve` on :8031 with the real Chroma store + Ollama embeddings → `register_bank` MCP tool registered **html / javascript / css** (15 sections each) — `interview_bank(bank-html)` = 15 immediately and follow-up retrieval hit the new domain's chunks with **no RAG restart**.
+- **Pending (user, after app testing):** next `.\start_services.ps1` run (the 3 banks are already in the store → Step 5 skips all 7, BM25 warms from Chroma at boot); Skill Update page upload → status flip; voice + text interviews on a new skill.
 
 ### Foundations (Phases 1–3, verified previously)
 - Scripted + LLM text interviews over the enterprise-rag-core MCP service (Phases 1–2).

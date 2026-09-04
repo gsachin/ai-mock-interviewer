@@ -9,3 +9,7 @@ build/
 gate_results/
 .tools/
 *.wav
+.tools/
+*.wav
+.tunnel_*
+.interviewer_tunnel

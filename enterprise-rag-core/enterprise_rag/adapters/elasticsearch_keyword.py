@@ -80,3 +80,14 @@ class ElasticsearchKeywordStore:
                     "department": r.department,
                 },
             )
+
+    async def delete_by_parent(self, parent_id: str, tenant_id: str) -> int:
+        resp = await self._client.delete_by_query(
+            index=self._index,
+            query={"bool": {"filter": [
+                {"term": {"tenant_id.keyword": tenant_id}},
+                {"term": {"parent_id.keyword": parent_id}},
+            ]}},
+            refresh=True,
+        )
+        return int(resp.get("deleted", 0))

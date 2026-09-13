@@ -31,10 +31,16 @@ chroma_data
 gate_results
 *.log
 
-# Docs and planning artifacts — not needed at runtime
+# Docs and planning artifacts — not needed at runtime.
+# NOTE: the question_banks/*.md re-include below is load-bearing, not tidiness.
+# Banks are *.md, so the broad **/*.md rule silently stripped all nine of them
+# from the image: /skills listed nothing and no interview could start, while
+# /health and the UI stayed perfectly healthy. Exclusions here must be checked
+# against runtime data, not just build output.
 docs
 **/*.md
 !README.md
+!question_banks/*.md
 
 # Test suite — runs in CI, not in the image
 tests

@@ -8,12 +8,12 @@
 
 | Status | Count | Stories |
 |---|---|---|
-| ✅ **Done and verified** | 3 | US-001, US-003, US-019 |
+| ✅ **Done and verified** | 6 | US-001, US-003, US-004, US-005, US-006, US-019 |
 | 🟡 **Partial — manifest/infra only** | 5 | US-014, US-015, US-016, US-017, US-018 |
 | ⚠️ **Written, not verified** | 1 | US-002 |
-| ❌ **Not started** | 11 | US-004…US-013, US-020 |
+| ❌ **Not started** | 8 | US-007…US-013, US-020 |
 
-**15 of 20 stories are not complete. No application-code story in Wave 1, 2 or 3 has been started.**
+**12 of 20 stories are not complete. Wave 1 is 3 of 7 done.**
 
 ## The structural finding
 
@@ -37,9 +37,9 @@ The consequence is the one flagged when we jumped to K8s manifests early: **the 
 
 | Story | Status | Evidence |
 |---|---|---|
-| **US-004** Sessions to Redis | ❌ Not started | `interviewer/server.py:54` still `_registry: dict[str, Session] = {}`. `RedisSessionStore` remains dead code on the serving path. |
-| **US-005** Session serializer | ❌ Not started | No `to_dict`/`from_dict` in `state_machine.py`. `RedisSessionStore.save` would still raise `TypeError`. |
-| **US-006** Probes + router | ❌ Not started | No `/healthz` or `/readyz` route. All manifests probe the legacy `/health`, which hardcodes `{"status":"ok"}`. |
+| **US-004** Sessions to Redis | ✅ **Done, verified in-cluster** | `_registry` removed; `_store` is the `SessionStore` seam. **Two API replicas, session created via the Service, `redis-sessions dbsize=1` with the exact `to_dict()` payload present, 8/8 reads across both replicas.** |
+| **US-005** Session serializer | ✅ **Done, verified** | `Session.to_dict()`/`from_dict()`. Unknown keys tolerated (rolling deploys); unknown `state` raises rather than silently rewinding an interview. Confirmed by the same Redis payload above. |
+| **US-006** Probes + router | ✅ **Done, verified in-cluster** | `/healthz` (checks nothing), `/readyz` (per-dependency breakdown), `/health` unchanged as a legacy alias. Routes on one `APIRouter` before the static mount. **Verified by taking Redis down: `/readyz` → 503 naming `store: TimeoutError`, `/healthz` → 200, the pod left the Ready set, Service endpoints went EMPTY, and it recovered to 1/1 when Redis returned.** |
 | **US-007** Config CORS | ❌ Not started | No `cors_origins` in `config.py`; the four-entry localhost allowlist at `server.py:38-46` is unchanged. |
 | **US-008** httpx pooling + metrics | ❌ Not started | **6 per-call `httpx.AsyncClient(` construction sites remain** (`llm.py` 2, `rag_client.py` 1, `stt.py` 1, `tts.py` 2). `LLMConfig.timeout=300.0` still on the voice path; MCP handshake still per retrieval. |
 | **US-009** BankStore protocol | ❌ Not started | No `interviewer/bank_store.py`. |

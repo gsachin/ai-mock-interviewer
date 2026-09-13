@@ -22,6 +22,19 @@ def _as_bool(value: str | None, default: bool = False) -> bool:
     return value.strip().lower() in _TRUTHY
 
 
+def _as_origins(value: str | None) -> tuple[str, ...]:
+    """Comma-separated origins. Unset keeps the historical defaults.
+
+    An explicitly EMPTY value means "no CORS allowed" and is respected rather
+    than falling back to the defaults -- conflating "" with unset would make it
+    impossible to turn CORS off, which is exactly what a same-origin ingress
+    deployment wants.
+    """
+    if value is None:
+        return InterviewerConfig.__dataclass_fields__["cors_origins"].default
+    return tuple(o.strip() for o in value.split(",") if o.strip())
+
+
 @dataclass(frozen=True)
 class InterviewerConfig:
     rag_mcp_url: str = "http://127.0.0.1:8000/mcp"
@@ -52,6 +65,15 @@ class InterviewerConfig:
     kokoro_model_dir: str | None = None  # None = ~/.cache/mock-interviewer/kokoro
     voice_llm_base_url: str | None = None
     voice_llm_model: str | None = None
+    # Voice-path LLM timeout, separate from the 300 s judge/LLM default.
+    #
+    # 300 s is fine for judging (off the hot path, bounded by
+    # answer_timeout_s) and catastrophic on the voice path: a stalled vLLM
+    # would hang a spoken turn for FIVE MINUTES while the candidate sits in
+    # silence. The measured first token on CPU llama3.2:3b is 280-800 ms, so
+    # 8 s is roughly 10x headroom — long enough not to trip on a slow start,
+    # short enough to fail fast and re-prompt instead of going quiet.
+    voice_llm_timeout_s: float = 8.0
     # Phase 3 voice: LiveKit deployment. The worker and the /voice/token
     # endpoint share these; unset keys = LiveKit dev-mode defaults.
     livekit_url: str = "http://127.0.0.1:7880"
@@ -80,6 +102,25 @@ class InterviewerConfig:
     # service and take /voice/token and the static UI down with them, which
     # are the two things that must keep working.
     ready_requires_rag: bool = False
+    # CORS (US-007). The defaults are byte-identical to the four values that
+    # were hardcoded in server.py, so the dev flow is unchanged -- but they are
+    # now overridable, which is what unblocks serving from a real hostname.
+    # The hardcoded list blocked every request the moment the app sat behind an
+    # ingress, and the failure mode is a browser-side CORS error with a
+    # perfectly healthy server: nothing in the logs, nothing in the probes.
+    #
+    # In-cluster this is usually just the ingress origin, or empty: the UI is
+    # served from this same app, so it is same-origin and needs no CORS at all.
+    # The four localhost entries exist for the legacy `python -m http.server`
+    # (:8080) and Streamlit (:8501) paths, which call the token endpoint
+    # cross-origin.
+    cors_origins: tuple[str, ...] = (
+        "http://localhost:8080", "http://127.0.0.1:8080",
+        "http://localhost:8501", "http://127.0.0.1:8501",
+    )
+    # Credentials cannot be combined with a wildcard origin, so this stays a
+    # separate opt-in rather than something inferred from `*` being present.
+    cors_allow_credentials: bool = False
 
     @classmethod
     def from_env(cls, environ: dict[str, str] | None = None) -> "InterviewerConfig":
@@ -108,6 +149,8 @@ class InterviewerConfig:
             kokoro_model_dir=env.get("INTERVIEW_KOKORO_MODEL_DIR"),
             voice_llm_base_url=env.get("INTERVIEW_VOICE_LLM_BASE_URL"),
             voice_llm_model=env.get("INTERVIEW_VOICE_LLM_MODEL"),
+            voice_llm_timeout_s=float(
+                env.get("INTERVIEW_VOICE_LLM_TIMEOUT_S", "8")),
             livekit_url=env.get("LIVEKIT_URL", "http://127.0.0.1:7880"),
             livekit_api_key=env.get("LIVEKIT_API_KEY"),
             livekit_api_secret=env.get("LIVEKIT_API_SECRET"),
@@ -117,4 +160,7 @@ class InterviewerConfig:
             web_dir=env.get("INTERVIEW_WEB_DIR"),
             bank_dir=env.get("INTERVIEW_BANK_DIR"),
             ready_requires_rag=_as_bool(env.get("INTERVIEW_READY_REQUIRES_RAG")),
+            cors_origins=_as_origins(env.get("INTERVIEW_CORS_ORIGINS")),
+            cors_allow_credentials=_as_bool(
+                env.get("INTERVIEW_CORS_ALLOW_CREDENTIALS")),
         )

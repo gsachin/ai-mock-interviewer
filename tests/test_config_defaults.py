@@ -62,6 +62,17 @@ BASELINE_DEFAULTS = {
     # Readiness (US-006) — off by default so a RAG outage cannot pull the API
     # out of service.
     "ready_requires_rag": False,
+    # CORS (US-007) — these four are the values that were hardcoded in
+    # server.py. Changing them changes the Windows dev flow.
+    "cors_origins": (
+        "http://localhost:8080", "http://127.0.0.1:8080",
+        "http://localhost:8501", "http://127.0.0.1:8501",
+    ),
+    "cors_allow_credentials": False,
+    # Voice-path LLM timeout (US-008). Deliberately 8 s, not the 300 s judge
+    # default: a stalled engine must fail fast rather than leave a candidate
+    # in silence for five minutes.
+    "voice_llm_timeout_s": 8.0,
 }
 
 

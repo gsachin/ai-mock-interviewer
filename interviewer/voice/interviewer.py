@@ -54,6 +54,9 @@ def build_voice_interviewer(config: InterviewerConfig, rag: Any,
             base_url=config.voice_llm_base_url or config.llm_base_url,
             model=config.voice_llm_model,
             token=config.llm_token,
+            # The hot path gets its own short timeout; the judge below keeps
+            # the 300 s default because its wait is off the critical path.
+            timeout=config.voice_llm_timeout_s,
         ))
     return LLMInterviewer(
         rag, OpenAICompatibleLLM(LLMConfig(

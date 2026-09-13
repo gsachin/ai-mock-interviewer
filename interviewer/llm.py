@@ -55,10 +55,44 @@ class OpenAICompatibleLLM:
     """Streaming chat-completions client with a test-only transport seam."""
 
     def __init__(self, config: LLMConfig, *,
-                 transport: httpx.AsyncBaseTransport | None = None):
+                 transport: httpx.AsyncBaseTransport | None = None,
+                 limits: httpx.Limits | None = None):
         self._cfg = config
         self._transport = transport
+        # Bounded pool. Without explicit limits httpx defaults to 100 max
+        # connections, which is more than a single interview needs and hides
+        # a runaway from the operator.
+        self._limits = limits or httpx.Limits(
+            max_connections=32, max_keepalive_connections=16)
+        self._client: httpx.AsyncClient | None = None
+        # Kept for the pre-US-008 call pattern (read `llm.metrics` after a
+        # call). New callers pass their own object — see respond_stream.
         self.metrics = LLMMetrics()
+
+    async def aclose(self) -> None:
+        """Release the pool. Called from the API lifespan and the worker's
+        shutdown hook: a long-lived AsyncClient holds sockets open, and a pod
+        that is terminating should not wait on them."""
+        if self._client is not None:
+            await self._client.aclose()
+            self._client = None
+
+    def _get_client(self) -> httpx.AsyncClient:
+        """One client per engine instance, built lazily.
+
+        Previously every call constructed its own AsyncClient, so each LLM
+        turn (and every TTS sentence, STT call and MCP request elsewhere in
+        the codebase) paid a fresh TCP handshake and TLS negotiation. For a
+        local vLLM that is wasted work on the hot path; for a hosted endpoint
+        it is worse.
+        """
+        if self._client is None:
+            self._client = httpx.AsyncClient(
+                timeout=self._cfg.timeout,
+                transport=self._transport,
+                limits=self._limits,
+            )
+        return self._client
 
     def _headers(self) -> dict[str, str]:
         return {"Authorization": f"Bearer {self._cfg.token}"} if self._cfg.token else {}
@@ -71,11 +105,36 @@ class OpenAICompatibleLLM:
             )
         return self._cfg.model
 
+    def _metrics_target(self, metrics: LLMMetrics | None) -> LLMMetrics:
+        """Resolve where this call records its timings.
+
+        A fresh object per call is what makes a SHARED engine safe. Until now
+        every engine was constructed per interview and calls were sequential,
+        so mutating `self.metrics` never collided — but US-011 shares engines
+        per process, and then two concurrent turns would overwrite each
+        other's first-token latency. That number feeds the latency SLO, so
+        misattributing it corrupts the metric the whole budget is judged by.
+
+        Passing the object in also keeps the attribution honest per hop: the
+        brain holds this exact object, so it cannot read a neighbour's.
+        """
+        if metrics is not None:
+            metrics.first_token_ms = None
+            metrics.total_ms = 0.0
+            return metrics
+        # No explicit target: preserve the original contract exactly (a NEW
+        # object, so a caller that read `llm.metrics` after the call still
+        # sees this call's numbers and not the previous one's).
+        self.metrics = LLMMetrics()
+        return self.metrics
+
     async def respond_stream(self, messages: list[dict], *,
                              temperature: float = 0.2,
-                             max_tokens: int = 256) -> AsyncIterator[str]:
+                             max_tokens: int = 256,
+                             metrics: LLMMetrics | None = None) -> AsyncIterator[str]:
         """Yields content deltas; TTS should start on the first sentence, not
-        on completion. Metrics land on ``self.metrics`` after exhaustion."""
+        on completion. Metrics land on ``metrics`` (or ``self.metrics``) after
+        exhaustion."""
         body = {
             "model": self._require_model(),
             "messages": messages,
@@ -84,25 +143,25 @@ class OpenAICompatibleLLM:
             "max_tokens": max_tokens,
         }
         t0 = time.perf_counter()
-        self.metrics = LLMMetrics()
-        async with httpx.AsyncClient(timeout=self._cfg.timeout,
-                                     transport=self._transport) as client:
-            async with client.stream(
-                "POST", f"{self._cfg.base_url}/chat/completions",
-                json=body, headers=self._headers(),
-            ) as resp:
-                resp.raise_for_status()
-                async for line in resp.aiter_lines():
-                    delta = parse_sse_delta(line)
-                    if delta is not None:
-                        if self.metrics.first_token_ms is None:
-                            self.metrics.first_token_ms = (time.perf_counter() - t0) * 1000
-                        yield delta
-        self.metrics.total_ms = (time.perf_counter() - t0) * 1000
+        m = self._metrics_target(metrics)
+        client = self._get_client()
+        async with client.stream(
+            "POST", f"{self._cfg.base_url}/chat/completions",
+            json=body, headers=self._headers(),
+        ) as resp:
+            resp.raise_for_status()
+            async for line in resp.aiter_lines():
+                delta = parse_sse_delta(line)
+                if delta is not None:
+                    if m.first_token_ms is None:
+                        m.first_token_ms = (time.perf_counter() - t0) * 1000
+                    yield delta
+        m.total_ms = (time.perf_counter() - t0) * 1000
 
     async def respond(self, messages: list[dict], *,
                       temperature: float = 0.2,
-                      max_tokens: int = 256) -> str:
+                      max_tokens: int = 256,
+                      metrics: LLMMetrics | None = None) -> str:
         """Non-streaming completion (evaluation, scoring, summaries)."""
         body = {
             "model": self._require_model(),
@@ -112,16 +171,14 @@ class OpenAICompatibleLLM:
             "max_tokens": max_tokens,
         }
         t0 = time.perf_counter()
-        self.metrics = LLMMetrics()
-        async with httpx.AsyncClient(timeout=self._cfg.timeout,
-                                     transport=self._transport) as client:
-            resp = await client.post(
-                f"{self._cfg.base_url}/chat/completions",
-                json=body, headers=self._headers(),
-            )
-            resp.raise_for_status()
-            data = resp.json()
-        self.metrics.total_ms = (time.perf_counter() - t0) * 1000
+        m = self._metrics_target(metrics)
+        resp = await self._get_client().post(
+            f"{self._cfg.base_url}/chat/completions",
+            json=body, headers=self._headers(),
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        m.total_ms = (time.perf_counter() - t0) * 1000
         choices = data.get("choices") or []
         if not choices:
             return ""

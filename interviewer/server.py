@@ -49,14 +49,13 @@ _store = (RedisSessionStore(config.redis_url)
           if config.session_store == "redis"
           else InMemorySessionStore())
 
-# The legacy static UI option (python -m http.server :8080) and the Streamlit
-# UI call the token endpoint from another origin — allow the local ones.
+# Origins come from config, defaulting to the four that used to be hardcoded
+# here. See InterviewerConfig.cors_origins for why the default is those and why
+# an in-cluster deployment usually wants an empty list instead.
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "http://localhost:8080", "http://127.0.0.1:8080",
-        "http://localhost:8501", "http://127.0.0.1:8501",
-    ],
+    allow_origins=list(config.cors_origins),
+    allow_credentials=config.cors_allow_credentials,
     allow_methods=["*"],
     allow_headers=["*"],
 )

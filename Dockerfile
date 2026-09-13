@@ -25,17 +25,13 @@ ENV PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1
 
-# libgomp1     — OpenMP runtime required by ctranslate2 (faster-whisper) and
-#                onnxruntime (kokoro).
-# ffmpeg       — pydub decodes the MP3 that ElevenLabs returns. Only needed for
-#                the cloud TTS providers; kept because the provider is a config
-#                flip and a missing decoder would be a runtime surprise.
-# curl         — container healthchecks.
+# Only curl here. The native dependencies the voice stack needs (libgomp1 for
+# ctranslate2/onnxruntime, ffmpeg for pydub's MP3 decode) are installed in the
+# layers that actually use them — the API image touches none of them, and
+# ffmpeg in particular is a large C library with a long CVE history that has no
+# business in the internet-facing component.
 RUN apt-get update \
- && apt-get install -y --no-install-recommends \
-      libgomp1 \
-      ffmpeg \
-      curl \
+ && apt-get install -y --no-install-recommends curl \
  && rm -rf /var/lib/apt/lists/*
 
 # Non-root. Matches the manifests' runAsUser.
@@ -45,26 +41,36 @@ RUN groupadd --gid 10001 app \
 WORKDIR /app
 
 # ─────────────────────────────── deps ────────────────────────────────────────
-# Dependency layer, split from source so a code-only change does not reinstall.
-FROM base AS deps
+# Two dependency layers, not one. The API image must NOT carry the voice stack:
+# ctranslate2, onnxruntime, av and kokoro carry several hundred MB that the
+# management plane never touches, and the API is the internet-facing component,
+# so they are pure attack surface there. Building the voice layer on top of the
+# API layer (rather than beside it) means the two still share a base layer.
+#
+# Verified by probing the built image, not assumed: an earlier single-layer
+# version shipped livekit.agents / faster_whisper / kokoro_onnx / ctranslate2 /
+# onnxruntime inside mock-interviewer-api with no use for any of them, which
+# also contradicted the split's whole stated rationale.
+FROM base AS deps-api
 
-COPY pyproject.toml README.md ./
-# The build context has no interviewer/ at this point, so install deps only via
-# a throwaway metadata shim rather than the real package (which needs the source).
-RUN python - <<'PY'
-import tomllib, pathlib, subprocess, sys
-data = tomllib.loads(pathlib.Path("pyproject.toml").read_text())
-extras = data["project"].get("optional-dependencies", {})
-pkgs = list(data["project"]["dependencies"])
-for name in ("api", "voice"):
-    pkgs += extras.get(name, [])
-# Drop environment markers' packages we cannot resolve here; pip handles them.
-subprocess.check_call([sys.executable, "-m", "pip", "install", *pkgs])
-PY
+COPY pyproject.toml README.md docker/install-deps.py /tmp/deps/
+RUN python /tmp/deps/install-deps.py api
+
+# Adds [voice] on top of the API layer. Only the worker target uses this.
+# libgomp1 — OpenMP runtime for ctranslate2 (faster-whisper) and onnxruntime
+#            (kokoro).
+# ffmpeg   — pydub decodes the MP3 that ElevenLabs returns. Only exercised by
+#            the cloud TTS providers, but the provider is a config flip and a
+#            missing decoder would otherwise be a runtime surprise.
+FROM deps-api AS deps-worker
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends libgomp1 ffmpeg \
+ && rm -rf /var/lib/apt/lists/*
+RUN python /tmp/deps/install-deps.py voice
 
 # ─────────────────────────────── api ─────────────────────────────────────────
 # Management plane + the static UI it serves. No LiveKit, no STT/TTS models.
-FROM deps AS api
+FROM deps-api AS api
 
 # Reproduce the dev directory layout at /app.
 #
@@ -101,7 +107,7 @@ CMD ["uvicorn", "interviewer.server:app", \
 # drops faster-whisper, kokoro-onnx and their model weights entirely, which is
 # what takes cold start under ~2s. Until then it carries the in-process engines
 # so the current behaviour is preserved.
-FROM deps AS worker
+FROM deps-worker AS worker
 
 COPY interviewer/     /app/interviewer/
 COPY web/             /app/web/
@@ -129,7 +135,13 @@ CMD ["python", "-m", "interviewer.voice.worker", "start"]
 # in production it is a separate deployment. Multi-replica requires the shared
 # backends (Qdrant + Elasticsearch) — see DG-03 — which are selected by env,
 # not by this image.
-FROM deps AS rag
+FROM deps-api AS rag
+
+# libgomp1 for the ONNX reranker (onnxruntime). No ffmpeg — the RAG service
+# decodes no audio.
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends libgomp1 \
+ && rm -rf /var/lib/apt/lists/*
 
 COPY enterprise-rag-core/ /rag/
 WORKDIR /rag

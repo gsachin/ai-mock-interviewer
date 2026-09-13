@@ -95,6 +95,17 @@ configMapGenerator:
       - INTERVIEW_STT_BASE_URL=http://stt:8000/v1
       - INTERVIEW_TTS_PROVIDER=kokoro-http
       - INTERVIEW_TTS_BASE_URL=http://tts:8880/v1
+      # ENVIRONMENT OVERRIDE, not a production value. The code default is 8 s,
+      # which is right where a voice turn is GPU-served (first token measured
+      # at 280-800 ms). This kind cluster runs ollama on 6 CPUs shared with
+      # Speaches and Kokoro, where a measured single llama3.2:3b turn takes
+      # ~22 s -- so the production default times out on EVERY call and the
+      # interview dies with httpx.ReadTimeout.
+      #
+      # Raising it here rather than in code, because the tight default is the
+      # correct behaviour on the hardware the product targets: it is what stops
+      # a stalled engine leaving a candidate in silence for five minutes.
+      - INTERVIEW_VOICE_LLM_TIMEOUT_S=120
       # ── RAG: in-process backends, no search tier ──────────────────────────
       # Chroma on a local volume instead of Qdrant, and the in-RAM BM25 index
       # instead of Elasticsearch (DG-03/DAT-04/DAT-05). The search tier is not

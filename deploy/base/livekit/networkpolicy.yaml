@@ -39,6 +39,19 @@ spec:
       ports:
         - port: 7880
           protocol: TCP
+        # WebRTC MEDIA back to the worker, not just signalling. The worker's
+        # egress policy already permits 7881/TCP and 7882/UDP outbound -- that
+        # is only half the path, and the other half was missing here, so the
+        # SFU's media never reached the client and the peer connection timed
+        # out with `wait_pc_connection timed out`.
+        #
+        # Second time this exact asymmetry bit: an egress rule without its
+        # matching ingress rule looks correct in isolation and fails at
+        # runtime. See voice-worker/networkpolicy.yaml for the first.
+        - port: 7881
+          protocol: TCP
+        - port: 7882
+          protocol: UDP
     # The management plane mints room JWTs and manages rooms over LiveKit's
     # server API (and would need it again for the scaler's room snapshot).
     - from:

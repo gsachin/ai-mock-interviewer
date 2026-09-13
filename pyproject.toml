@@ -32,6 +32,19 @@ api = [
     # RedisSessionStore imports it lazily, which is why the app still runs on
     # the `memory` default without this; a redis-configured deployment needs it.
     "redis>=7.4,<8",
+    # POST /voice/token mints a LiveKit JWT, so the API's serving path needs
+    # this. It sat only in [voice] -- which pulls in livekit-agents and the
+    # whole engine stack -- because the endpoint was written alongside the
+    # voice worker and never considered a management-plane dependency.
+    #
+    # The failure was a 503 with a correct-looking body on an otherwise healthy
+    # pod: keys set, probes green, connection fine. FIFTH defect of the
+    # "a dependency declared somewhere other than where it is used" family,
+    # and the reason that family deserves a mechanical check rather than care.
+    #
+    # livekit-api is a small JWT/AccessToken helper, NOT livekit-agents -- the
+    # API image stays lean (287MB) by taking this alone.
+    "livekit-api>=1,<2",
 ]
 web = [
     "streamlit>=1.40",        # web/streamlit_app.py — interactive text-mode interview UI

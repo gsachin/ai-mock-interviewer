@@ -42,6 +42,35 @@ spec:
   policyTypes:
     - Egress
   egress:
+    # The management API -- and ONLY for the in-cluster end-to-end smoke test.
+    #
+    # This rule's absence was the actual blocker for a long debugging session,
+    # and the reason is worth recording because the mistake was asymmetric:
+    # NetworkPolicy is BIDIRECTIONAL. An ingress rule on `api` was added and
+    # verified correct, but the packet was dropped by THIS policy on the way
+    # out, before the API's rules were ever consulted. Deleting and recreating
+    # the api policy changed nothing because the wrong half was being fixed.
+    #
+    # `kubectl get netpol api-ingress` looked right the whole time. The
+    # diagnostic that actually found it was listing the worker's EGRESS rules
+    # and noticing `api` was not among them -- not inspecting the policy that
+    # appeared to be failing.
+    #
+    # scripts/e2e_voice_client.py needs livekit-rtc and a working TTS engine to
+    # synthesise candidate answers, and the worker image is the one pod here
+    # that carries both. It cannot run from outside the cluster either, since
+    # /voice/token returns the in-cluster LIVEKIT_URL.
+    #
+    # A test affordance, not a production requirement: the worker does not
+    # otherwise call the API. When US-020's CI e2e job lands, scope this to a
+    # dedicated test ServiceAccount rather than the worker's whole lifetime.
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: api
+      ports:
+        - port: 8010
+          protocol: TCP
     # ── The SFU, including the media ports ──────────────────────────────────
     # 7880 is the signalling API (WebSocket + Twirp) and it is the port the
     # worker's LIVEKIT_URL names, so it is the one everybody remembers.

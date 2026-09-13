@@ -59,6 +59,9 @@ BASELINE_DEFAULTS = {
     # pre-migration behaviour. Containers set these explicitly.
     "web_dir": None,
     "bank_dir": None,
+    # Readiness (US-006) — off by default so a RAG outage cannot pull the API
+    # out of service.
+    "ready_requires_rag": False,
 }
 
 

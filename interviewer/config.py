@@ -6,6 +6,21 @@ The ``RAG_CORE_*`` namespace belongs to the enterprise-rag-core service
 import os
 from dataclasses import dataclass
 
+_TRUTHY = {"1", "true", "yes", "on"}
+
+
+def _as_bool(value: str | None, default: bool = False) -> bool:
+    """Env booleans, parsed permissively.
+
+    ``bool(os.environ.get(...))`` is the classic bug here: the string "false"
+    is truthy, so ``INTERVIEW_READY_REQUIRES_RAG=false`` would read as True —
+    the exact opposite of what the operator wrote, on the flag that decides
+    whether a RAG blip takes the API out of service.
+    """
+    if value is None:
+        return default
+    return value.strip().lower() in _TRUTHY
+
 
 @dataclass(frozen=True)
 class InterviewerConfig:
@@ -57,6 +72,14 @@ class InterviewerConfig:
     # fails SILENTLY (the is_dir() guard), serving nothing with no error.
     web_dir: str | None = None      # INTERVIEW_WEB_DIR — static UI folder
     bank_dir: str | None = None     # INTERVIEW_BANK_DIR — question_banks folder
+    # Readiness gate for the RAG service. Defaults to False, and that default
+    # is a design decision rather than a convenience: the app is built to
+    # survive a RAG outage (GET /skills reports rag_ok=false instead of
+    # failing; an interview degrades to last-known rubric). Requiring RAG for
+    # readiness would invert that — a RAG blip would pull the API pods out of
+    # service and take /voice/token and the static UI down with them, which
+    # are the two things that must keep working.
+    ready_requires_rag: bool = False
 
     @classmethod
     def from_env(cls, environ: dict[str, str] | None = None) -> "InterviewerConfig":
@@ -93,4 +116,5 @@ class InterviewerConfig:
             judge_model=env.get("INTERVIEW_JUDGE_MODEL"),
             web_dir=env.get("INTERVIEW_WEB_DIR"),
             bank_dir=env.get("INTERVIEW_BANK_DIR"),
+            ready_requires_rag=_as_bool(env.get("INTERVIEW_READY_REQUIRES_RAG")),
         )

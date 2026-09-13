@@ -117,32 +117,33 @@ spec:
           # replica would ever be Ready, and with maxUnavailable: 0 the rollout
           # would hang forever: a cluster that looks green and serves nothing.
           #
-          # When US-006 lands, change exactly this:
-          #   startupProbe   → /healthz   (nothing else changes)
-          #   livenessProbe  → /healthz   (depends on NOTHING: a Redis or RAG
-          #                                blip must never restart API pods)
-          #   readinessProbe → /readyz    (per-dependency report: session_store
-          #                                and banks required, rag optional per
-          #                                INTERVIEW_READY_REQUIRES_RAG)
-          # Thresholds below are already the ones US-006 specifies, so only the
-          # paths move.
+          # US-006 has landed, so these are the real probes:
+          #   /healthz  liveness  — checks NOTHING. A Redis or RAG blip must
+          #                        never restart API pods; a liveness probe that
+          #                        consults dependencies turns someone else's
+          #                        outage into a restart loop of healthy pods.
+          #   /readyz   readiness — per-dependency report. Returns 503 with a
+          #                        breakdown naming which thing broke, rather
+          #                        than just that something did.
+          # /health is kept as a legacy alias (start_services.ps1 greps its
+          # body) but is no longer probed.
           startupProbe:
             httpGet:
-              path: /health
+              path: /healthz
               port: http
             periodSeconds: 5
             timeoutSeconds: 2
             failureThreshold: 24 # 2 min: the image is local, boot is seconds
           livenessProbe:
             httpGet:
-              path: /health
+              path: /healthz
               port: http
             periodSeconds: 10
             timeoutSeconds: 2
             failureThreshold: 3
           readinessProbe:
             httpGet:
-              path: /health
+              path: /readyz
               port: http
             periodSeconds: 5
             timeoutSeconds: 2

@@ -71,6 +71,16 @@ data:
   # these URLs name services that do not exist yet and the rag Deployment will
   # not become Ready. That is stated rather than hidden, and it is why the local
   # overlay replaces all three backends with in-process ones.
+  # Telemetry and Hub calls OFF. Inside a locked-down namespace those HTTPS
+  # requests are dropped by the egress policy WITHOUT an RST, so they hang in
+  # SYN_SENT forever -- observed as four sockets stuck on :443 and a RAG
+  # process that had used 2.5 s of CPU in two hours. This is what made RAG
+  # never bind :8031, which made interview_bank fail, which made every
+  # interview wrap straight after the greeting. It looked exactly like a bug
+  # in brain.py.
+  ANONYMIZED_TELEMETRY: "False"
+  CHROMA_TELEMETRY_ENABLED: "false"
+  HF_HUB_DISABLE_TELEMETRY: "1"
   RAG_CORE_VECTOR_BACKEND: "qdrant"
   RAG_CORE_QDRANT_URL: "http://qdrant:6333"
   RAG_CORE_KEYWORD_BACKEND: "elasticsearch"

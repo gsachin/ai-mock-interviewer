@@ -165,7 +165,11 @@ ENV RAG_CORE_RERANK_MODEL_PATH=/rag/models/reranker/minilm-int8.onnx
 # artifact is tiny and immutable. Populate the HF cache at BUILD time, when the
 # build host does have network, then run offline.
 ENV HF_HOME=/opt/hf
-RUN python -c "from huggingface_hub import snapshot_download; snapshot_download('cross-encoder/ms-marco-MiniLM-L-6-v2')"
+RUN python -c "from huggingface_hub import snapshot_download; snapshot_download('cross-encoder/ms-marco-MiniLM-L-6-v2')"  && chmod -R a+rX /opt/hf
+# The chmod is load-bearing. The container runs as uid 10001 but the cache is
+# written above as root, so without it the tokenizer is present and UNREADABLE
+# -- which surfaces as LocalEntryNotFoundError from reranker.py and reads like
+# a missing download rather than a permissions problem.
 # Offline from here on: a cache miss should fail fast and loudly at startup
 # rather than hang on a retry loop against an unreachable host.
 ENV HF_HUB_OFFLINE=1

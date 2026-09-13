@@ -1,0 +1,53 @@
+# Local kind cluster for the mock-interviewer migration.
+#
+#   ./.tools/kind.exe create cluster --config deploy/overlays/local/kind-config.yaml
+#
+# WHAT THIS CAN VERIFY (and why it is worth a cluster at all):
+#   probes firing when a dependency is genuinely down, preStop drain completing
+#   rather than cutting an interview, KEDA scaling on the queue-depth metric,
+#   PDB behaviour during a node drain, resource accounting, and the manifest
+#   syntax/schema itself.
+#
+# WHAT IT CANNOT VERIFY — stated plainly so nobody mistakes a green run here
+# for a production answer:
+#   1. GPU workloads. kind has no GPU passthrough, so the `gpu` overlay is
+#      replaced by CPU engine images (Ollama / Speaches / Kokoro-CPU). This
+#      tests the ORCHESTRATION, never the latency budget.
+#   2. NetworkPolicy enforcement. kind's default CNI (kindnet) does NOT
+#      enforce NetworkPolicy — the objects apply and are silently inert. To
+#      actually test policy, install Calico (see the commented step in
+#      start_services.ps1) or accept that this is syntax checking only.
+#   3. Real media path. LiveKit WebRTC over a LoadBalancer with real TLS is a
+#      cloud concern; locally we take the TCP-over-ingress path.
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+name: mock-interviewer
+
+nodes:
+  # Control plane carries the ingress-ready label so ingress-nginx can bind
+  # host ports 80/443 through the extraPortMappings below.
+  - role: control-plane
+    kubeadmConfigPatches:
+      - |
+        kind: InitConfiguration
+        nodeRegistration:
+          kubeletExtraArgs:
+            node-labels: "ingress-ready=true"
+    extraPortMappings:
+      # Deliberately NOT 8010/8031/8501/7880 — those belong to the Windows dev
+      # flow (start_services.ps1). Clashing would mean the two stacks could not
+      # run side by side, which is exactly what a migration needs.
+      # 8088 rather than 8080: the launcher's legacy static UI already owns 8080.
+      - containerPort: 80
+        hostPort: 8088
+        protocol: TCP
+      - containerPort: 443
+        hostPort: 8443
+        protocol: TCP
+
+  # Two workers, not one. A single worker cannot demonstrate the things this
+  # cluster exists to test: scale-down draining (something must remain
+  # serving), topologySpreadConstraints actually spreading, or a node drain
+  # evicting pods under a PDB.
+  - role: worker
+  - role: worker

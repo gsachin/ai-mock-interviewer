@@ -13,6 +13,123 @@ of html/javascript/css banks happens on the **next** `start_services.ps1` run
 
 ## 1. ✅ DONE — implemented and verified
 
+### Autoscaling plan + Wave 0 scaffold — NEW 2026-09-12 (branch `auto-scalling-arch`)
+Ran the full **`ai-sdlc-product-brain`** pipeline over this codebase (Stages 0–11,
+2 Stage-5 iterations) → **`docs/sdlc/`**, 38 artifacts: intent, BRD (Discovery
+Matrix 13/13 + Evidence Register), 11 use cases × 14 scenario rows, 3 workflows
+with failure drills, data/state analysis with a Load & Capacity Model, the
+coverage gate, modularization (13 modules), architecture with per-module scale
+profiles, 14 brownfield reconciliation notes, 8 module BRD+TRD pairs, and 20
+self-contained stories. **Validator: 703 passed, 0 failed** — scorecard
+**PASS**, **STATUS: COMPLETE**.
+
+Scaffold landed (`Dockerfile` multi-target `base→api|worker|rag`, `.dockerignore`,
+`docker-compose.yml` mirroring the cluster with CPU engine images, and the
+platform-conditional `av` pin in `pyproject.toml`).
+
+**Phase 0's first gate is VERIFIED, not assumed** — built a real Linux image:
+`av 15.1.0` + `livekit.agents 1.8.1` import cleanly on `python:3.12-slim-bookworm`.
+The `av==12.3.0` pin is confirmed Windows-only (Smart App Control), so relaxing
+it elsewhere is safe. The Windows venv stays on `livekit-agents 1.7.1` while the
+image resolves 1.8.1 — minor-version drift, which is what the image pin controls.
+
+**Findings that changed the plan** (recorded as `REC-14`, read from
+`livekit-agents` 1.8.1 source inside the image):
+1. `WorkerOptions.drain_timeout` — a **first-class drain**. The plan was going to
+   hand-roll `preStop` polling; the supported hook becomes primary.
+2. `WorkerOptions.load_fnc` — supported self-reported load, so per-replica
+   dispatch accuracy no longer needs the private-attribute monkey-patch.
+3. `WorkerOptions.prometheus_port` / `prometheus_multiproc_dir` — resolves the
+   forked-job-process metrics-registry problem the plan had flagged as a gotcha.
+4. `_default_load_threshold = ServerEnvOption(dev_default=inf, prod_default=0.7)`
+   — **explains the `float("inf")` workaround exactly**: the 0.7 gate the author
+   disabled is the *production* default, and in-process TTS/STT made it refuse
+   dispatch. Confirms the diagnosis.
+5. `prometheus-client` is **already a transitive dependency** of `livekit-agents`
+   → the metrics story adds no new package.
+
+**Corrected a near-miss:** an initial class-level `hasattr` check suggested
+`_devmode` / `_load_threshold` / `_worker_load` were gone from 1.8.1, which would
+have meant a crash the moment a finite load threshold made refusals routine.
+Reading the source showed they are **instance** attributes set in `__init__` —
+**no defect**. Recorded so nobody re-derives the false positive.
+
+**Wave 0 COMPLETE and verified end-to-end:**
+- `INTERVIEW_WEB_DIR` / `INTERVIEW_BANK_DIR` config keys added (both default
+  `None` = today's package-relative resolution, so dev is unchanged);
+  `skills.bank_dir()` resolves override → env → default, keeping the existing
+  `monkeypatch.setattr(skills, "BANK_DIR", …)` test working.
+- `interviewer/logging_setup.py` — JSON to stdout with `LOG_FORMAT=text` as the
+  **default**, reproducing the original format string byte-for-byte so Windows
+  logs are unchanged. Wired into both `server.py` (which previously configured
+  no logging at all) and `voice/worker.py`.
+- `tests/test_config_defaults.py` — 37 new tests asserting every default equals
+  its baseline literal, plus a guard that fails if a *new* field is added
+  without a decision about the Windows flow. **This is what makes `AS-05` true
+  by test rather than by care.**
+- **Suite: 158 passed, 6 deselected** (the 121 baseline + 37 new), floor intact.
+- **Image verified**: api target builds and runs as uid 10001; `/health` returns
+  correctly; `GET /` serves 38568 bytes and `/skills.html` 17157 bytes — proving
+  the `/app` layout + `PYTHONPATH` fix works (the silent-empty-UI failure mode is
+  closed).
+
+**Two real bugs found and fixed during verification, both invisible until run:**
+1. `LOG_FORMAT=json` did **not** reach uvicorn's own loggers — they install
+   their own handlers and do not propagate, so a log shipper would have
+   received a mixed plain-text/JSON stream. Fixed by routing `uvicorn`,
+   `uvicorn.error` and `uvicorn.access` through the root handler.
+2. uvicorn's `color_message` extra leaked raw ANSI escape codes into JSON
+   output. Now excluded — a log pipeline has no terminal behind it.
+
+### Local kind cluster — NEW 2026-09-12
+
+**Cluster up:** `mock-interviewer`, k8s **v1.37.0**, 3 nodes (1 control-plane +
+2 workers), all Ready. kind **v0.33.0** installed to `.tools\kind.exe`
+(git-ignored, beside the LiveKit binary) — pinned deliberately, because the
+`latest` redirect currently serves a **v0.34 alpha** and a dev loop should not
+pick up a pre-release cluster binary silently.
+
+**Two workers, not one.** A single worker cannot demonstrate what this cluster
+exists to test: scale-down draining (something must remain serving),
+`topologySpreadConstraints` actually spreading, or a node drain evicting pods
+under a PDB.
+
+**Ingress ports 8088/8443**, deliberately not 8010/8031/8501/7880 — those belong
+to the Windows dev flow, and the two stacks must be able to run side by side.
+
+**Launcher integration:** `.\start_services.ps1 -WithKind` (and `-RecreateKind`).
+Additive and non-fatal — if kind cannot start, the app stack is untouched.
+Downloads kind on first use, creates the cluster from
+`deploy\overlays\local\kind-config.yaml` when absent, waits for nodes Ready,
+and reports status. `-RecreateKind` without `-WithKind` warns rather than
+silently doing nothing.
+
+**Partially verified** by extracting the real Step 8f block from the file and
+executing it (not a copy): detected the existing cluster, waited for readiness,
+reported 3/3, set its flag. `start_services.ps1` parse-checks clean (0 errors).
+**Not yet exercised:** the fresh-create path and `-RecreateKind`, since the
+cluster already exists — those need a teardown to test honestly.
+
+**What this cluster CANNOT verify** — recorded so a green run is not mistaken
+for a production answer:
+1. **GPU workloads** — kind has no GPU passthrough; the `gpu` overlay is
+   replaced by CPU engines (Ollama / Speaches / Kokoro-CPU). Tests the
+   orchestration, never the latency budget.
+2. **NetworkPolicy enforcement** — kind's default CNI (kindnet) does **not**
+   enforce NetworkPolicy. The objects apply and are silently inert. Real
+   enforcement needs Calico installed.
+3. **Real media path** — LiveKit WebRTC over a LoadBalancer with real TLS is a
+   cloud concern; locally we take the TCP-over-ingress path.
+
+**Next:** Kustomize base + `local` overlay deploying onto this cluster, then
+Wave 1 statelessness.
+
+**Open for the PO** (from the Stage-5 gate, deliberately not closed): the
+multi-tenancy/auth model, the interview retention/privacy posture — now sharper,
+because extracting STT to a GPU service sends candidate audio across the cluster
+network where it previously never left the worker process — peak concurrency, and
+whether 1500 ms is a hard requirement or an aspiration.
+
 ### Streamlit text-UI fixes — NEW 2026-09-04 (spawn bug + voice-parity feedback)
 1. **Spawn bug** ("Interview ended without a summary"): the page gated the worker-thread
    spawn on `running` — **False exactly on the spawn tick** (thread is None) — so the

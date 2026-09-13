@@ -48,6 +48,17 @@
     With -WithVoice -WithTunnel the launcher ALSO tunnels LiveKit (:7880)
     and restarts the management plane so /voice/token hands remote pages the
     public wss URL -- the demo becomes shareable over the internet.
+.PARAMETER WithKind
+    Ensure a local Kubernetes (kind) cluster exists and is ready, for the
+    autoscaling migration (see docs/sdlc/). Downloads kind.exe into .tools\
+    on first use (git-ignored), creates the 3-node cluster from
+    deploy\overlays\local\kind-config.yaml when absent, and waits for nodes to
+    report Ready. Additive: the normal stack still starts exactly as before.
+    The cluster is NOT part of the app runtime -- it is a separate deployment
+    target used to verify probes, drain, KEDA scaling and NetworkPolicy.
+.PARAMETER RecreateKind
+    Delete and recreate the kind cluster before starting. Destructive: drops
+    anything deployed into it. Requires -WithKind.
 .EXAMPLE
     .\start_services.ps1
     .\start_services.ps1 -WithStreamlit
@@ -66,7 +77,9 @@ param(
     [switch]$WithWeb = $false,
     [switch]$WithStreamlit = $false,
     [switch]$WithTunnel = $false,
-    [switch]$WithVoice = $false
+    [switch]$WithVoice = $false,
+    [switch]$WithKind = $false,
+    [switch]$RecreateKind = $false
 )
 
 # ---- Config ---------------------------------------------------------------
@@ -103,6 +116,15 @@ $VoiceLLMModel = "llama3.2:3b"
 # Voice sharing over the internet (-WithVoice -WithTunnel): cached public
 # hostname of the LiveKit quick tunnel (git-ignored, like the page tunnel).
 $LiveKitTunnelFile = Join-Path $ProjectRoot ".tunnel_livekit"
+
+# Kubernetes (optional -WithKind). The kind binary lives in .tools\ beside the
+# LiveKit one (both git-ignored). Pinned rather than "latest": the latest
+# redirect currently serves a v0.34 alpha, and a pre-release cluster binary is
+# not something a dev loop should pick up silently.
+$KindVersion   = "v0.33.0"
+$KindExe       = Join-Path $ProjectRoot ".tools\kind.exe"
+$KindCluster   = "mock-interviewer"
+$KindConfig    = Join-Path $ProjectRoot "deploy\overlays\local\kind-config.yaml"
 
 # Ports the launcher owns (Streamlit only joins when requested).
 $LaunchPorts = @($Port, $RagPort)
@@ -884,6 +906,83 @@ if ($WithTunnel -and $WithVoice -and $LiveKitProcess) {
     }
 }
 
+# ==== Step 8f: Kubernetes (kind) cluster (optional -WithKind) =============
+# The migration target. Additive and non-fatal: if kind cannot start, the
+# normal app stack is untouched and still running.
+$KindReady = $false
+if ($RecreateKind -and -not $WithKind) {
+    Write-Warn "-RecreateKind requires -WithKind -- ignoring it. No cluster was touched."
+}
+if ($WithKind) {
+    Write-Step ("Step 8f: Kubernetes (kind) cluster '{0}'" -f $KindCluster)
+
+    # Docker must be up -- kind runs the nodes as containers.
+    $dockerOk = $false
+    try {
+        docker info --format '{{.ServerVersion}}' *> $null
+        if ($LASTEXITCODE -eq 0) { $dockerOk = $true }
+    } catch { }
+    if (-not $dockerOk) {
+        Write-Err "Docker is not running -- kind needs it to host the cluster nodes. Start Docker Desktop and re-run with -WithKind."
+    } else {
+        # kind binary (pinned; .tools\ is git-ignored like the LiveKit one).
+        if (-not (Test-Path $KindExe)) {
+            Write-Warn "kind not found at $KindExe -- downloading $KindVersion ..."
+            $kindUrl = "https://kind.sigs.k8s.io/dl/$KindVersion/kind-windows-amd64"
+            try {
+                New-Item -ItemType Directory -Force -Path (Split-Path $KindExe) | Out-Null
+                Invoke-WebRequest -Uri $kindUrl -OutFile $KindExe -UseBasicParsing
+                Write-OK "Downloaded kind $KindVersion"
+            } catch {
+                Write-Err "kind download failed: $($_.Exception.Message)"
+                Write-Warn "Install manually: winget install Kubernetes.kind"
+            }
+        }
+        if (Test-Path $KindExe) {
+            $kindVer = (& $KindExe version) 2>&1
+            Write-OK "kind: $kindVer"
+
+            if ($RecreateKind) {
+                Write-Warn "RecreateKind: deleting cluster '$KindCluster' (this drops everything deployed into it) ..."
+                & $KindExe delete cluster --name $KindCluster 2>&1 | Out-Null
+            }
+
+            $existing = @(& $KindExe get clusters 2>$null)
+            if ($existing -contains $KindCluster) {
+                Write-OK "Cluster '$KindCluster' already exists (use -RecreateKind to rebuild)"
+            } elseif (-not (Test-Path $KindConfig)) {
+                Write-Err "kind config not found: $KindConfig"
+            } else {
+                Write-Host "  Creating 3-node cluster from $KindConfig ..."
+                & $KindExe create cluster --config $KindConfig 2>&1 | ForEach-Object { Write-Host "    $_" }
+            }
+
+            if ((@(& $KindExe get clusters 2>$null)) -contains $KindCluster) {
+                # Wait for Ready -- a fresh cluster reports NotReady for ~30s
+                # while the CNI comes up. Reporting "ready" before this is the
+                # classic way to get a confusing first deploy.
+                Write-Host "  Waiting for nodes to report Ready ..."
+                $deadline = (Get-Date).AddMinutes(3)
+                do {
+                    $nodeLines = @(kubectl get nodes --no-headers 2>$null)
+                    $ready = @($nodeLines | Where-Object { $_ -match '\sReady\s' }).Count
+                    $total = $nodeLines.Count
+                    if ($total -ge 3 -and $ready -eq $total) { break }
+                    Start-Sleep -Seconds 5
+                } while ((Get-Date) -lt $deadline)
+
+                if ($total -ge 3 -and $ready -eq $total) {
+                    $KindReady = $true
+                    Write-OK "Cluster ready: $ready/$total nodes"
+                    kubectl get nodes --no-headers 2>$null | ForEach-Object { Write-Host "    $_" }
+                } else {
+                    Write-Warn "Cluster exists but $ready/$total nodes are Ready -- check: kubectl get nodes"
+                }
+            }
+        }
+    }
+}
+
 # ==== Step 9: Summary =====================================================
 Write-Host ""
 Write-Host ("{0}{1}AI MOCK INTERVIEWER STARTED{2}" -f $GREEN, $BOLD, $RESET)
@@ -900,6 +999,9 @@ if ($LiveKitProcess) {
 if ($VoiceWorkerProcess) {
     Write-Host ("{0}Voice worker:{1}         PID {0}{2}{1}  (agent: interviewer-agent)" -f $CYAN, $RESET, $VoiceWorkerProcess.Id)
     Write-Host ("{0}Voice interview:{1}      {0}http://127.0.0.1:{2}/{1}  -- spoken interview in the browser" -f $CYAN, $RESET, $Port)
+}
+if ($KindReady) {
+    Write-Host ("{0}Kubernetes:{1}           kind cluster '{2}' is ready  (kubectl config use-context kind-{2})" -f $CYAN, $RESET, $KindCluster)
 }
 if ($StreamlitProcess) {
     Write-Host ("{0}Streamlit UI:{1}        {0}http://localhost:{2}{1}  (interview chat)" -f $CYAN, $RESET, $StreamlitPort)

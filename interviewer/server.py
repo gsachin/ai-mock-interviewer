@@ -7,7 +7,6 @@ path runs in the LiveKit agent worker). Retrieval happens in the standalone
 enterprise-rag-core MCP service; this app calls it through
 ``interviewer.rag_client.RagClient``.
 """
-import threading
 import uuid
 from pathlib import Path
 from typing import Any
@@ -21,6 +20,7 @@ from interviewer import skills
 from interviewer.config import InterviewerConfig
 from interviewer.logging_setup import configure_logging
 from interviewer.rag_client import RagClient
+from interviewer.session_store import InMemorySessionStore, RedisSessionStore
 from interviewer.state_machine import InterviewerState, Session
 from interviewer.voice import AGENT_NAME
 
@@ -51,8 +51,20 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-_registry: dict[str, Session] = {}
-_lock = threading.Lock()
+# Sessions live in the configured store, not in this process.
+#
+# They were a module-level dict behind a threading.Lock, which made the API
+# single-replica by construction: POST /sessions on replica A, GET on replica
+# B, and the second returns 404 non-deterministically. `RedisSessionStore`
+# already existed and was correct -- it was simply never wired in, so this is
+# mostly deletion.
+#
+# `memory` stays the DEFAULT so the Windows dev flow (which sets almost no
+# environment) and the existing tests behave exactly as before. Module-level
+# and named `_store` to match the `_rag` seam that tests already swap.
+_store = (RedisSessionStore(config.redis_url)
+          if config.session_store == "redis"
+          else InMemorySessionStore())
 
 
 class CreateSessionRequest(BaseModel):
@@ -80,17 +92,16 @@ async def create_session(body: CreateSessionRequest) -> dict[str, Any]:
         tenant_id=body.tenant_id,
         domain=body.domain or config.default_domain,
     )
-    with _lock:
-        _registry[session.session_id] = session
+    await _store.save(session.session_id, session.to_dict())
     return {"session_id": session.session_id, "state": session.state.value}
 
 
 @app.get("/sessions/{session_id}")
 async def get_session(session_id: str) -> dict[str, Any]:
-    with _lock:
-        session = _registry.get(session_id)
-    if session is None:
+    data = await _store.load(session_id)
+    if data is None:
         raise HTTPException(status_code=404, detail="unknown session")
+    session = Session.from_dict(data)
     return {
         "session_id": session.session_id,
         "tenant_id": session.tenant_id,
@@ -124,8 +135,7 @@ async def voice_token(body: VoiceTokenRequest) -> dict[str, Any]:
     session = Session(session_id=uuid.uuid4().hex[:12],
                       tenant_id="default", domain=domain)
     room = f"interview-{domain}-{session.session_id}"
-    with _lock:
-        _registry[session.session_id] = session
+    await _store.save(session.session_id, session.to_dict())
 
     token = (api.AccessToken(config.livekit_api_key, config.livekit_api_secret)
              .with_identity(f"candidate-{session.session_id}")

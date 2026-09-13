@@ -24,6 +24,14 @@ api = [
     "fastapi>=0.141,<1",
     "uvicorn[standard]>=0.52,<1",
     "python-multipart>=0.0.18",   # POST /skills multipart upload (Skill Update page)
+    # The session store is a runtime dependency of the management plane now
+    # that sessions live in Redis (US-004), not in a process-local dict.
+    # It previously sat only in [dev] because nothing on the serving path
+    # imported it -- so the image built, started, passed its probes, and then
+    # failed on the FIRST request with "No module named 'redis'" and a 500.
+    # RedisSessionStore imports it lazily, which is why the app still runs on
+    # the `memory` default without this; a redis-configured deployment needs it.
+    "redis>=7.4,<8",
 ]
 web = [
     "streamlit>=1.40",        # web/streamlit_app.py — interactive text-mode interview UI

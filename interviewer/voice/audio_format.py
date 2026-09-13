@@ -43,6 +43,25 @@ def s16le_to_s16le48k(audio: bytes, sample_rate: int,
     return np.clip(samples, -32768.0, 32767.0).astype("<i2").tobytes()
 
 
+def s16le16k_to_wav(pcm: bytes) -> bytes:
+    """Raw 16 kHz mono s16le PCM -> in-memory RIFF/WAVE (the inverse of the
+    conversions above, stdlib only).
+
+    The transcription endpoint wants a *file*, but the capture buffer in
+    ``voice/agent.py`` is containerless — raw frames straight off the mic, no
+    header to strip. stdlib ``wave`` writes the 44-byte RIFF header into a
+    BytesIO, so the OpenAI-compatible shape is satisfied without ffmpeg and
+    without a new dependency.
+    """
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as wav:
+        wav.setnchannels(1)
+        wav.setsampwidth(2)      # s16le frames
+        wav.setframerate(16000)
+        wav.writeframes(pcm)
+    return buf.getvalue()
+
+
 def wav_to_s16le48k(audio: bytes) -> bytes:
     """Self-describing RIFF wav (Piper/Kokoro emit this) -> 48 kHz mono
     s16le. Handles 8/16/24/32-bit PCM via the stdlib ``wave`` module."""

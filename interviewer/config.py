@@ -43,7 +43,7 @@ class InterviewerConfig:
     top_k: int = 5
     # Voice quality is a hard requirement: the interviewer must sound like a
     # natural human. Robotic (espeak-class) voices are excluded from production.
-    tts_provider: str = "cartesia"     # cartesia | elevenlabs | kokoro | piper
+    tts_provider: str = "cartesia"     # cartesia | elevenlabs | kokoro | kokoro-http | piper
     tts_voice_id: str | None = None    # provider voice preset; None = provider default
     # Phase 2 LLM: any OpenAI-compatible chat endpoint (vLLM / Ollama / MLX).
     llm_base_url: str = "http://127.0.0.1:8000/v1"
@@ -53,10 +53,16 @@ class InterviewerConfig:
     redis_url: str = "redis://localhost:6379"
     # Phase 3 voice: STT/TTS providers + the hot-path LLM (a fast small model —
     # the judge LLM above can stay slow since judging is off the hot path).
-    stt_provider: str = "stub"         # deepgram | faster-whisper | stub
+    stt_provider: str = "stub"         # deepgram | faster-whisper | whisper-http | stub
     deepgram_api_key: str | None = None
     whisper_model: str = "base"
     whisper_device: str = "auto"
+    # Remote engine endpoints (US-011). None means the engine service is not
+    # deployed: resolve_stt/resolve_tts then raise, so a cluster that selected
+    # whisper-http/kokoro-http without an endpoint fails at startup rather than
+    # mid-interview. The ConfigMap and docker-compose set both.
+    stt_base_url: str | None = None    # INTERVIEW_STT_BASE_URL (http://stt:8000/v1)
+    tts_base_url: str | None = None    # INTERVIEW_TTS_BASE_URL (http://tts:8880/v1)
     cartesia_api_key: str | None = None
     elevenlabs_api_key: str | None = None
     piper_binary: str = "piper"
@@ -153,6 +159,8 @@ class InterviewerConfig:
             deepgram_api_key=env.get("INTERVIEW_DEEPGRAM_API_KEY"),
             whisper_model=env.get("INTERVIEW_WHISPER_MODEL", "base"),
             whisper_device=env.get("INTERVIEW_WHISPER_DEVICE", "auto"),
+            stt_base_url=env.get("INTERVIEW_STT_BASE_URL"),
+            tts_base_url=env.get("INTERVIEW_TTS_BASE_URL"),
             cartesia_api_key=env.get("INTERVIEW_CARTESIA_API_KEY"),
             elevenlabs_api_key=env.get("INTERVIEW_ELEVENLABS_API_KEY"),
             piper_binary=env.get("INTERVIEW_PIPER_BINARY", "piper"),

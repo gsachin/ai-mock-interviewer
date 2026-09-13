@@ -305,7 +305,7 @@ def test_voice_factory_threads_session_config(monkeypatch):
     """INTERVIEW_MAX_QUESTIONS / INTERVIEW_ANSWER_TIMEOUT_S /
     INTERVIEW_JUDGE_MODEL land on the brain and the judge LLM."""
     from interviewer.voice import interviewer as vi
-    from interviewer.voice.stubs import StubSTT, StubTTS
+    from interviewer.voice.stubs import StubTTS
 
     captured: dict = {}
 
@@ -316,7 +316,11 @@ def test_voice_factory_threads_session_config(monkeypatch):
         metrics = type("M", (), {"first_token_ms": 0.0, "total_ms": 0.0})()
 
     monkeypatch.setattr(vi, "OpenAICompatibleLLM", FakeLLM)
-    monkeypatch.setattr(vi, "resolve_stt", lambda *a: StubSTT())
+    # No `resolve_stt` patch: the factory no longer calls it (US-011). It used
+    # to resolve an STT engine and discard it, because LLMInterviewer takes no
+    # `stt` parameter -- dead code, and on remote engines a wasted connection
+    # pool per room. The live STT is resolved in voice/agent.py, which is the
+    # only thing that transcribes.
     monkeypatch.setattr(vi, "resolve_tts", lambda *a: StubTTS())
 
     cfg = InterviewerConfig(

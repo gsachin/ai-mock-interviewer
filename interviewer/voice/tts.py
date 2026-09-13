@@ -17,7 +17,8 @@ from interviewer.voice.audio_format import (
 )
 from interviewer.voice.protocols import TTSEngine
 
-NATURAL_VOICE_PROVIDERS = {"elevenlabs", "cartesia", "kokoro", "piper", "stub"}
+NATURAL_VOICE_PROVIDERS = {"elevenlabs", "cartesia", "kokoro", "kokoro-http",
+                           "piper", "stub"}
 
 _CARTESIA_TTS_URL = "https://api.cartesia.ai/tts/bytes"
 _ELEVENLABS_TTS_URL = "https://api.elevenlabs.io/v1/text-to-speech/{voice_id}"
@@ -151,6 +152,67 @@ class KokoroTTS:
         return f32le_to_s16le48k(samples.astype("<f4").tobytes(), sample_rate)
 
 
+class RemoteKokoroTTS:
+    """Kokoro behind Kokoro-FastAPI (``{base_url}/audio/speech``).
+
+    The same model the app already ships locally, moved into its own GPU
+    service — so the voice identity carries over unchanged through
+    INTERVIEW_KOKORO_VOICE (af_heart), which is the point: an operator flipping
+    to the remote engine must not hear a different interviewer. Kokoro is
+    native 24 kHz and the contract is 48 kHz, so the returned wav goes through
+    the existing, already-tested ``wav_to_s16le48k`` rather than a hand-rolled
+    resample.
+    """
+
+    def __init__(self, base_url: str, voice: str = "af_heart",
+                 model: str = "kokoro", *, timeout: float = 30.0,
+                 transport: httpx.AsyncBaseTransport | None = None):
+        if not base_url:
+            raise ValueError(
+                "INTERVIEW_TTS_BASE_URL is required for tts_provider=kokoro-http")
+        # a trailing slash would produce ".../v1//audio/speech"
+        self._base_url = base_url.rstrip("/")
+        self._voice = voice
+        self._model = model
+        self._timeout = timeout
+        self._transport = transport
+        # Bounded and small on purpose: sentence-level synthesis is one call at
+        # a time per room, so a 100-connection default pool would only hide a
+        # runaway from the operator.
+        self._limits = httpx.Limits(max_connections=8, max_keepalive_connections=4)
+        self._client: httpx.AsyncClient | None = None
+
+    def _get_client(self) -> httpx.AsyncClient:
+        """One client per engine, built lazily (the module must import with no
+        network). A per-call client would pay a fresh TCP handshake for every
+        spoken sentence, which is the cost pooling exists to remove."""
+        if self._client is None:
+            self._client = httpx.AsyncClient(
+                timeout=self._timeout,
+                limits=self._limits,
+                transport=self._transport,
+            )
+        return self._client
+
+    async def aclose(self) -> None:
+        if self._client is not None:
+            await self._client.aclose()
+            self._client = None
+
+    async def synthesize(self, text: str) -> bytes:
+        """Returns 48 kHz mono s16le PCM per the TTSEngine contract. The wav
+        round-trip is deliberate: Kokoro speaks at 24 kHz and requesting raw
+        PCM would mean the rate had to be tracked separately, while a
+        self-describing wav lets the tested converter read it off the file."""
+        resp = await self._get_client().post(
+            f"{self._base_url}/audio/speech",
+            json={"model": self._model, "input": text, "voice": self._voice,
+                  "response_format": "wav"},
+        )
+        resp.raise_for_status()
+        return wav_to_s16le48k(resp.content)
+
+
 def resolve_tts(provider: str, config) -> TTSEngine:
     provider = (provider or "").lower()
     if provider not in NATURAL_VOICE_PROVIDERS:
@@ -172,6 +234,11 @@ def resolve_tts(provider: str, config) -> TTSEngine:
         return PiperTTS(config.piper_binary, config.piper_model)
     if provider == "kokoro":
         return KokoroTTS(config.kokoro_voice, config.kokoro_model_dir)
+    if provider == "kokoro-http":
+        # tts_voice_id wins when set so an operator can pin a voice for the
+        # remote engine without touching the local one's setting.
+        return RemoteKokoroTTS(config.tts_base_url,
+                               config.tts_voice_id or config.kokoro_voice)
     from interviewer.voice.stubs import StubTTS
 
     return StubTTS()

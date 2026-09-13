@@ -40,6 +40,11 @@ BASELINE_DEFAULTS = {
     "deepgram_api_key": None,
     "whisper_model": "base",
     "whisper_device": "auto",
+    # Remote engine endpoints (US-011). None = "not deployed": the resolve step
+    # raises, which is the fail-fast a cluster wants. The Windows dev flow
+    # supplies neither and keeps running the in-process engines.
+    "stt_base_url": None,
+    "tts_base_url": None,
     "cartesia_api_key": None,
     "elevenlabs_api_key": None,
     "piper_binary": "piper",

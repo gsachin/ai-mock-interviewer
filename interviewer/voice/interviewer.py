@@ -7,7 +7,6 @@ from interviewer.brain import CandidateAnswer, LLMInterviewer
 from interviewer.config import InterviewerConfig
 from interviewer.llm import LLMConfig, OpenAICompatibleLLM
 from interviewer.voice.budget import LatencyBudgetTracker
-from interviewer.voice.stt import resolve_stt
 from interviewer.voice.tts import resolve_tts
 
 
@@ -34,7 +33,8 @@ class AudioCandidate:
 def build_voice_interviewer(config: InterviewerConfig, rag: Any,
                             session: Any, sink: Any = None,
                             on_event: Any = None,
-                            decider: Any = None) -> LLMInterviewer:
+                            decider: Any = None, *,
+                            tts: Any = None) -> LLMInterviewer:
     """Voice-enabled brain: STT/TTS engines from config, a fast voice LLM
     for the hot path (falls back to the judge LLM), a fresh latency budget
     tracker, and an optional playback sink (the LiveKit room). The judge LLM
@@ -46,8 +46,17 @@ def build_voice_interviewer(config: InterviewerConfig, rag: Any,
     answer wait; ``config.judge_model`` overrides the judge model on the same
     base URL (INTERVIEW_JUDGE_MODEL).
     """
-    stt = resolve_stt(config.stt_provider, config)
-    tts = resolve_tts(config.tts_provider, config)
+    # NO stt here, deliberately. This function used to call resolve_stt and
+    # discard the result: LLMInterviewer.__init__ takes `tts`, `voice_llm`,
+    # `budget`, `sink`, `on_event` and `decider` -- and no `stt`. So every
+    # interview built an STT engine and threw it away, which on the remote
+    # engines would mean a wasted connection pool per room. The live STT
+    # belongs to voice/agent.py, which is the only thing that transcribes.
+    #
+    # `tts` may be injected so the worker can build engines once per process;
+    # falling back to resolving here keeps the dev/CLI paths working unchanged.
+    if tts is None:
+        tts = resolve_tts(config.tts_provider, config)
     voice_llm = None
     if config.voice_llm_base_url or config.voice_llm_model:
         voice_llm = OpenAICompatibleLLM(LLMConfig(

@@ -16,7 +16,7 @@ from livekit import agents
 from interviewer.config import InterviewerConfig
 from interviewer.logging_setup import configure_logging
 from interviewer.voice import AGENT_NAME
-from interviewer.voice.agent import run_agent
+from interviewer.voice.agent import install_engines, run_agent
 from interviewer.voice.stt import resolve_stt
 from interviewer.voice.tts import resolve_tts
 
@@ -34,8 +34,13 @@ def main() -> None:
             "voice worker requires real engines: set "
             "INTERVIEW_STT_PROVIDER=faster-whisper and "
             "INTERVIEW_TTS_PROVIDER=kokoro (stub engines are for tests)")
-    resolve_stt(config.stt_provider, config)  # raises on missing credentials
-    resolve_tts(config.tts_provider, config)  # raises on missing credentials
+    # Build the engines ONCE here, not per room, and hand them to every
+    # interview. These calls already ran as a validation gate; now their
+    # result is kept. Both raise on a missing credential or an unset base URL,
+    # so this remains the fail-fast it was -- it just stops throwing away the
+    # engines it built.
+    install_engines(stt=resolve_stt(config.stt_provider, config),
+                    tts=resolve_tts(config.tts_provider, config))
     if not config.voice_llm_base_url and not config.voice_llm_model:
         raise SystemExit(
             "INTERVIEW_VOICE_LLM_BASE_URL/INTERVIEW_VOICE_LLM_MODEL are "
@@ -58,10 +63,22 @@ def main() -> None:
         api_key=config.livekit_api_key or "devkey",
         api_secret=config.livekit_api_secret or "secret",
         ws_url=config.livekit_url.replace("http", "ws"),
-        # Always accept jobs: the CPU-load gate (default threshold 0.7) marks
-        # the worker unavailable during TTS/STT bursts on a busy dev machine,
-        # and the server then refuses to dispatch at all.
-        load_threshold=float("inf"),
+        # Finite, and this is the payoff of US-011 rather than a tweak.
+        #
+        # This was float("inf") as a documented workaround: the default CPU
+        # gate marks the worker unavailable during TTS/STT bursts, and the
+        # server then refuses to dispatch at all. Reading livekit-agents'
+        # source explains why -- `_default_load_threshold` is
+        # ServerEnvOption(dev_default=math.inf, prod_default=0.7), so the 0.7
+        # gate the author disabled is the PRODUCTION default, and the bursts
+        # were the in-process engines.
+        #
+        # With STT/TTS moved to remote services the worker is I/O-bound, its
+        # CPU is silero VAD and JSON, and the gate becomes accurate. Leaving it
+        # at infinity is not merely unnecessary now -- it is actively wrong
+        # with more than one replica, because it tells the SFU this worker can
+        # always take another interview, so dispatch cannot spread.
+        load_threshold=0.95,
     )
     server = agents.AgentServer.from_server_options(options)
     _orig_is_available = server._is_available
@@ -77,7 +94,18 @@ def main() -> None:
                         server._load_threshold)
         return result
 
-    server._is_available = _log_unavailable  # type: ignore[method-assign]
+    # Guarded on purpose. This reaches into a PRIVATE attribute of a
+    # third-party class, and `livekit-agents` is pinned to a minor in
+    # pyproject for exactly this reason -- but a diagnostic that becomes an
+    # import-time crash on a version bump is worse than no diagnostic, so a
+    # rename degrades to a warning instead of taking the worker down.
+    try:
+        server._is_available = _log_unavailable  # type: ignore[method-assign]
+    except AttributeError:
+        log.warning(
+            "livekit-agents no longer exposes _is_available; refusal reasons "
+            "will not be logged. Check the pinned version before upgrading.")
+
     agents.cli.run_app(server)
 
 

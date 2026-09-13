@@ -43,7 +43,10 @@ s3 = [
     "aioboto3>=13,<16",
 ]
 voice = [
-    "livekit-agents>=1",      # Phase 3: LiveKit agent worker (VAD, turn detection, rtc)
+    # Pinned to a MINOR, not `>=1`. worker.py reads server.draining and wraps
+    # server._is_available -- private API. A floating constraint that renames
+    # one of those turns a diagnostic into an import-time crash (REC-06).
+    "livekit-agents>=1.8,<1.9",
     "livekit-api>=1",         # AccessToken for the /voice/token endpoint
     "livekit-plugins-silero>=1",  # silero VAD
     "faster-whisper>=1.1",    # self-hosted STT (CTranslate2, lazy model load)

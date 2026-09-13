@@ -11,6 +11,7 @@ import time
 import httpx
 import numpy as np
 
+from interviewer.voice.audio_format import s16le16k_to_wav
 from interviewer.voice.protocols import STTEngine
 
 log = logging.getLogger(__name__)
@@ -117,6 +118,79 @@ class FasterWhisperSTT:
         return text
 
 
+class RemoteWhisperSTT:
+    """Whisper behind an OpenAI-compatible transcription endpoint (Speaches —
+    the maintained successor to faster-whisper-server).
+
+    The model lives in its own service, so the worker stays a small CPU-only
+    process with no ctranslate2 and no weights: an answer costs one HTTP call
+    instead of a 1.0 s CPU decode, and the worker becomes I/O-bound, which is
+    what makes CPU-load dispatch across replicas meaningful at all.
+    """
+
+    def __init__(self, base_url: str, model: str = "base",
+                 *, timeout: float = 30.0,
+                 transport: httpx.AsyncBaseTransport | None = None):
+        if not base_url:
+            raise ValueError(
+                "INTERVIEW_STT_BASE_URL is required for stt_provider=whisper-http")
+        # a trailing slash would produce ".../v1//audio/transcriptions"
+        self._base_url = base_url.rstrip("/")
+        self._model = model
+        self._timeout = timeout
+        self._transport = transport
+        # Bounded and small on purpose: two rooms per worker at most, so a
+        # 100-connection default pool would hide a runaway from the operator.
+        self._limits = httpx.Limits(max_connections=8, max_keepalive_connections=4)
+        self._client: httpx.AsyncClient | None = None
+
+    def _get_client(self) -> httpx.AsyncClient:
+        """One client per engine, built lazily (the module must import with no
+        network). Building it per call would pay a fresh TCP handshake for
+        every answer, which is exactly the cost the pooling exists to remove.
+        """
+        if self._client is None:
+            self._client = httpx.AsyncClient(
+                timeout=self._timeout,
+                limits=self._limits,
+                transport=self._transport,
+            )
+        return self._client
+
+    async def aclose(self) -> None:
+        if self._client is not None:
+            await self._client.aclose()
+            self._client = None
+
+    async def transcribe(self, audio_frame: bytes) -> str:
+        """``audio_frame`` is raw 16 kHz mono s16le PCM (the speech buffer),
+        wrapped into a wav container because the endpoint wants a file.
+
+        Clamped to the most recent 60 s: the worker buffers up to 120 s and the
+        endpoint decodes everything it is handed, so the ceiling has to be
+        engine-side (the local faster-whisper engine clamps for the same
+        reason).
+        """
+        if len(audio_frame) > MAX_AUDIO_BYTES:
+            log.info("whisper-http input clamped: %.1f s -> 60 s",
+                     len(audio_frame) / 32000.0)
+            audio_frame = audio_frame[-MAX_AUDIO_BYTES:]
+        resp = await self._get_client().post(
+            f"{self._base_url}/audio/transcriptions",
+            files={"file": ("audio.wav", s16le16k_to_wav(audio_frame), "audio/wav")},
+            data={"model": self._model},
+        )
+        resp.raise_for_status()
+        try:
+            return (resp.json().get("text") or "").strip()
+        except ValueError:
+            # 200 with a non-JSON body (an ingress error page, say) is not a
+            # crash: an empty transcript makes the worker re-prompt instead.
+            log.warning("whisper-http returned a non-JSON body (status %s)",
+                        resp.status_code)
+            return ""
+
+
 def resolve_stt(provider: str, config) -> STTEngine:
     provider = (provider or "").lower()
     if provider == "deepgram":
@@ -125,9 +199,11 @@ def resolve_stt(provider: str, config) -> STTEngine:
         return DeepgramSTT(config.deepgram_api_key)
     if provider in ("faster-whisper", "whisper"):
         return FasterWhisperSTT(config.whisper_model, config.whisper_device)
+    if provider == "whisper-http":
+        return RemoteWhisperSTT(config.stt_base_url, config.whisper_model)
     if provider == "stub":
         from interviewer.voice.stubs import StubSTT
 
         return StubSTT()
     raise ValueError(f"unknown stt_provider: {provider!r} "
-                     f"(deepgram | faster-whisper | stub)")
+                     f"(deepgram | faster-whisper | whisper-http | stub)")

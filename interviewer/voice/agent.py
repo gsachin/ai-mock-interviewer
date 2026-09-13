@@ -44,6 +44,28 @@ from interviewer.voice.livekit import (
 from interviewer.voice.stt import resolve_stt
 from interviewer.voice.trim import trim_speech_buffer
 
+# Engines built ONCE per process by worker.main(), reused by every room.
+#
+# With the local engines this mattered less -- faster-whisper cached its model
+# on the instance, so a per-room engine meant reloading weights per interview.
+# With the REMOTE engines (US-011) it is worse: each engine owns an
+# httpx.AsyncClient, so constructing per room means a fresh connection pool and
+# a fresh TCP handshake per interview, which quietly defeats the pooling work
+# in US-008 entirely.
+#
+# Empty by default: the dev/CLI paths that never call install_engines() keep
+# resolving per room exactly as before, so nothing here changes their behaviour.
+_process_engines: dict[str, object] = {}
+
+
+def install_engines(*, stt: object | None = None,
+                    tts: object | None = None) -> None:
+    """Called once by the worker before it registers with the SFU."""
+    if stt is not None:
+        _process_engines["stt"] = stt
+    if tts is not None:
+        _process_engines["tts"] = tts
+
 log = logging.getLogger(__name__)
 
 DOMAINS = ("system-design", "ios", "dsa", "devops")
@@ -125,11 +147,15 @@ async def run_agent(ctx: agents.JobContext) -> None:
     reviewer = LiveKitReviewer()
     interviewer = build_voice_interviewer(config, rag, session, sink=sink,
                                           on_event=publish_event,
-                                          decider=reviewer)
+                                          decider=reviewer,
+                                          tts=_process_engines.get("tts"))
     candidate = LiveKitCandidate()
-    # One STT engine per room: faster-whisper keeps its model warm across
-    # answers (re-resolving per answer would reload it every time).
-    stt = resolve_stt(config.stt_provider, config)
+    # Prefer the process-wide engine (built once in worker.main) and fall back
+    # to a per-room one for callers that never installed any -- the CLI and the
+    # tests. Faster-whisper keeps its model warm across answers either way;
+    # re-resolving per ANSWER would reload it every time, which is why even the
+    # fallback is per room rather than per turn.
+    stt = _process_engines.get("stt") or resolve_stt(config.stt_provider, config)
 
     # ── manual answer capture ───────────────────────────────────────────────
     # Mutable capture state shared by the closures below (a dict so nested

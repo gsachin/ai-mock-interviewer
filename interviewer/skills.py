@@ -11,6 +11,7 @@ lives in the RAG service and is probed separately (server endpoints call
 root venv never imports enterprise-rag-core, so the shape parser mirrors the
 RAG splitter's rules with a small regex instead of importing them.
 """
+import os
 import re
 from dataclasses import dataclass
 from pathlib import Path
@@ -19,7 +20,27 @@ from pathlib import Path
 SKILL_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,63}$")
 _SECTION_RE = re.compile(r"(?m)^## ")
 
+# Module-level override slot, honoured ahead of the environment. Tests set it
+# directly (monkeypatch.setattr(skills, "BANK_DIR", tmp_path)); leaving it as
+# the repo-relative default keeps every existing call site and test unchanged.
 BANK_DIR: Path = Path(__file__).resolve().parent.parent / "question_banks"
+
+
+def bank_dir() -> Path:
+    """Resolve the question-bank folder.
+
+    Precedence: explicit ``BANK_DIR`` override (tests) → ``INTERVIEW_BANK_DIR``
+    → the repo-relative default. Read here rather than from
+    ``interviewer.config`` on purpose: this module is deliberately stdlib-only
+    and free of package imports, so it stays a leaf that both ``server`` and
+    ``voice.agent`` can pull in cheaply. The same key is surfaced in
+    ``config.py``.
+
+    In-container this points at the materialised bank cache, which is what
+    lets a bank uploaded after a worker booted be recognised without a restart.
+    """
+    override = os.environ.get("INTERVIEW_BANK_DIR")
+    return Path(override) if override else BANK_DIR
 
 
 @dataclass(frozen=True)

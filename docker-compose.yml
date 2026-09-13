@@ -1,0 +1,256 @@
+# Local development stack — a faithful, GPU-free mirror of the cluster.
+#
+# The point of this file is PARITY. The engine URLs below are the same
+# environment variables the Kubernetes ConfigMaps set, and the compose service
+# names match the Kubernetes Service names, so the only thing that differs
+# between laptop and cluster is the hostname suffix.
+#
+#   docker compose up                          # core: api + worker + livekit + redis
+#   docker compose --profile rag up            # + RAG service and its stores
+#   docker compose --profile engines up        # + self-hosted CPU STT/TTS/LLM
+#   docker compose --profile legacy up         # + Streamlit (not deployed to the cluster)
+#
+# Kokoro-FastAPI and Speaches both publish CPU images, so a developer with no
+# GPU runs the IDENTICAL topology at lower speed. That is what makes the
+# engine-extraction acceptance criteria testable on a laptop.
+
+name: mock-interviewer
+
+x-interviewer-env: &interviewer-env
+  # ── RAG ────────────────────────────────────────────────────────────────────
+  RAG_MCP_URL: ${RAG_MCP_URL:-http://rag:8031/mcp}
+  INTERVIEW_DOMAIN: ${INTERVIEW_DOMAIN:-system-design}
+  INTERVIEW_TOP_K: ${INTERVIEW_TOP_K:-5}
+  # ── Sessions ───────────────────────────────────────────────────────────────
+  # Redis by default here (unlike the Windows dev flow, which stays on memory)
+  # so that a two-replica API test is meaningful locally.
+  INTERVIEW_SESSION_STORE: ${INTERVIEW_SESSION_STORE:-redis}
+  INTERVIEW_REDIS_URL: ${INTERVIEW_REDIS_URL:-redis://redis:6379}
+  # ── LLM ────────────────────────────────────────────────────────────────────
+  INTERVIEW_LLM_BASE_URL: ${INTERVIEW_LLM_BASE_URL:-http://ollama:11434/v1}
+  INTERVIEW_LLM_MODEL: ${INTERVIEW_LLM_MODEL:-qwen2.5:14b}
+  INTERVIEW_VOICE_LLM_BASE_URL: ${INTERVIEW_VOICE_LLM_BASE_URL:-http://ollama:11434/v1}
+  INTERVIEW_VOICE_LLM_MODEL: ${INTERVIEW_VOICE_LLM_MODEL:-llama3.2:3b}
+  INTERVIEW_JUDGE_MODEL: ${INTERVIEW_JUDGE_MODEL:-}
+  # Fail fast rather than hang a voice turn for five minutes on a stalled engine.
+  INTERVIEW_VOICE_LLM_TIMEOUT_S: ${INTERVIEW_VOICE_LLM_TIMEOUT_S:-8}
+  # ── Voice engines ──────────────────────────────────────────────────────────
+  # Phase 0 uses the in-process engines (this is what the worker image carries).
+  # Phase 2 flips these to whisper-http / kokoro-http and points them at the
+  # `stt` and `tts` services below — the URLs are already here so the flip is a
+  # two-line change.
+  INTERVIEW_STT_PROVIDER: ${INTERVIEW_STT_PROVIDER:-faster-whisper}
+  INTERVIEW_WHISPER_MODEL: ${INTERVIEW_WHISPER_MODEL:-base}
+  INTERVIEW_WHISPER_DEVICE: ${INTERVIEW_WHISPER_DEVICE:-cpu}
+  INTERVIEW_TTS_PROVIDER: ${INTERVIEW_TTS_PROVIDER:-kokoro}
+  INTERVIEW_KOKORO_VOICE: ${INTERVIEW_KOKORO_VOICE:-af_heart}
+  INTERVIEW_STT_BASE_URL: ${INTERVIEW_STT_BASE_URL:-http://stt:8000/v1}
+  INTERVIEW_TTS_BASE_URL: ${INTERVIEW_TTS_BASE_URL:-http://tts:8880/v1}
+  # ── Session shape ──────────────────────────────────────────────────────────
+  INTERVIEW_MAX_QUESTIONS: ${INTERVIEW_MAX_QUESTIONS:-3}
+  INTERVIEW_ANSWER_TIMEOUT_S: ${INTERVIEW_ANSWER_TIMEOUT_S:-60}
+  # ── LiveKit ────────────────────────────────────────────────────────────────
+  LIVEKIT_URL: ${LIVEKIT_URL:-http://livekit:7880}
+  LIVEKIT_API_KEY: ${LIVEKIT_API_KEY:-devkey}
+  LIVEKIT_API_SECRET: ${LIVEKIT_API_SECRET:-secret}
+  # ── Runtime ────────────────────────────────────────────────────────────────
+  LOG_FORMAT: ${LOG_FORMAT:-text}
+  INTERVIEW_BANK_DIR: ${INTERVIEW_BANK_DIR:-/app/question_banks}
+  INTERVIEW_WEB_DIR: ${INTERVIEW_WEB_DIR:-/app/web}
+  # Comma-separated; defaults mirror the four values currently hardcoded in
+  # server.py so behaviour is unchanged locally.
+  INTERVIEW_CORS_ORIGINS: ${INTERVIEW_CORS_ORIGINS:-http://localhost:8080,http://127.0.0.1:8080,http://localhost:8501,http://127.0.0.1:8501}
+
+services:
+  # ─────────────────────────────── core ──────────────────────────────────────
+  api:
+    build:
+      context: .
+      target: api
+    image: mock-interviewer-api:dev
+    environment: *interviewer-env
+    ports:
+      - "8010:8010"
+    depends_on:
+      redis:
+        condition: service_healthy
+      livekit:
+        condition: service_started
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8010/healthz"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 15s
+    # Scale with: docker compose up --scale api=2
+    # The session store is Redis, so both replicas answer for either session.
+
+  worker:
+    build:
+      context: .
+      target: worker
+    image: mock-interviewer-worker:dev
+    environment: *interviewer-env
+    depends_on:
+      livekit:
+        condition: service_started
+      redis:
+        condition: service_healthy
+    # No ports: the worker registers OUTBOUND with LiveKit and receives jobs.
+    # That is precisely why it scales on queue depth rather than on HTTP.
+    stop_grace_period: 900s   # mirrors terminationGracePeriodSeconds: 900
+    healthcheck:
+      # Phase 3 adds the control server on :8081 (US-014). Until then, process
+      # liveness is the honest check — it says nothing about SFU registration.
+      test: ["CMD", "pgrep", "-f", "interviewer.voice.worker"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+
+  livekit:
+    image: livekit/livekit-server:v1.9.7
+    command: ["--dev", "--bind", "0.0.0.0"]
+    ports:
+      - "7880:7880"
+      - "7881:7881"
+      - "7882:7882/udp"
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:7880/"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  redis:
+    # Plain Redis is sufficient here: the session store uses SET/GET/DEL only.
+    # RedisVL (RAG semantic cache) is a different concern and lives with the
+    # rag profile — keeping them separate is deliberate, so a session-store
+    # FLUSH can never break RAG caching or vice versa.
+    image: redis:7.4-alpine
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  # ────────────────────────── profile: engines ───────────────────────────────
+  # Phase 2 targets. CPU images, so this profile runs without a GPU — the same
+  # topology as the cluster's GPU node pool, just slower.
+  stt:
+    image: ghcr.io/speaches-ai/speaches:latest-cpu
+    profiles: ["engines"]
+    environment:
+      WHISPER__MODEL: ${INTERVIEW_WHISPER_MODEL:-Systran/faster-whisper-base}
+    ports:
+      - "8000:8000"
+    volumes:
+      - hf_cache:/home/ubuntu/.cache/huggingface
+
+  tts:
+    image: ghcr.io/remsky/kokoro-fastapi-cpu:latest
+    profiles: ["engines"]
+    ports:
+      - "8880:8880"
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8880/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 60s
+
+  ollama:
+    image: ollama/ollama:latest
+    profiles: ["engines"]
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama_data:/root/.ollama
+    # Pulls on first boot so `up` is a one-command start. Switch to
+    # `vllm/vllm-openai` on a GPU host — the app speaks the same API, so
+    # nothing but the URL changes.
+    entrypoint:
+      - /bin/sh
+      - -c
+      - |
+        ollama serve &
+        sleep 5
+        ollama pull ${INTERVIEW_VOICE_LLM_MODEL:-llama3.2:3b} || true
+        ollama pull ${INTERVIEW_LLM_MODEL:-qwen2.5:14b} || true
+        wait
+
+  # ──────────────────────────── profile: rag ─────────────────────────────────
+  rag:
+    build:
+      context: .
+      target: rag
+    image: mock-interviewer-rag:dev
+    profiles: ["rag"]
+    environment:
+      RAG_CORE_VECTOR_BACKEND: ${RAG_CORE_VECTOR_BACKEND:-qdrant}
+      RAG_CORE_QDRANT_URL: ${RAG_CORE_QDRANT_URL:-http://qdrant:6333}
+      RAG_CORE_KEYWORD_BACKEND: ${RAG_CORE_KEYWORD_BACKEND:-elasticsearch}
+      RAG_CORE_ELASTICSEARCH_URL: ${RAG_CORE_ELASTICSEARCH_URL:-http://elasticsearch:9200}
+      RAG_CORE_CACHE_BACKEND: ${RAG_CORE_CACHE_BACKEND:-redisvl}
+      RAG_CORE_REDIS_URL: ${RAG_CORE_REDIS_URL:-redis://redis:6379}
+      OLLAMA_URL: ${OLLAMA_URL:-http://ollama:11434}
+      EMBED_MODEL: ${EMBED_MODEL:-nomic-embed-text}
+    ports:
+      - "8031:8031"
+    depends_on:
+      redis:
+        condition: service_healthy
+
+  qdrant:
+    image: qdrant/qdrant:v1.19.0
+    profiles: ["rag"]
+    ports:
+      - "6333:6333"
+    volumes:
+      - qdrant_data:/qdrant/storage
+
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:9.5.0
+    profiles: ["rag"]
+    environment:
+      discovery.type: single-node
+      xpack.security.enabled: "false"
+      ES_JAVA_OPTS: -Xms1g -Xmx1g
+    ports:
+      - "9200:9200"
+    volumes:
+      - es_data:/usr/share/elasticsearch/data
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:9200/_cluster/health || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 60s
+
+  # ─────────────────────────── profile: legacy ───────────────────────────────
+  # Kept in the repo and runnable, but NOT deployed to the cluster: Streamlit
+  # needs a long-lived stateful session (a daemon thread plus queues per
+  # interview) and would need its own StatefulSet for no product value. Voice
+  # is the product; the text mode stays reachable through the CLI engine and
+  # the test suite.
+  streamlit:
+    image: python:3.12-slim-bookworm
+    profiles: ["legacy"]
+    working_dir: /app
+    environment: *interviewer-env
+    volumes:
+      - ./:/app
+    command:
+      - /bin/sh
+      - -c
+      - pip install -q -e ".[api,web]" && streamlit run web/streamlit_app.py --server.port 8501 --server.address 0.0.0.0
+    ports:
+      - "8501:8501"
+
+volumes:
+  hf_cache:
+  ollama_data:
+  qdrant_data:
+  es_data:

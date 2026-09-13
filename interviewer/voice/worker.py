@@ -14,13 +14,15 @@ import logging
 from livekit import agents
 
 from interviewer.config import InterviewerConfig
+from interviewer.logging_setup import configure_logging
 from interviewer.voice import AGENT_NAME
 from interviewer.voice.agent import run_agent
 from interviewer.voice.stt import resolve_stt
 from interviewer.voice.tts import resolve_tts
 
-logging.basicConfig(level=logging.INFO,
-                    format="%(asctime)s %(levelname)s %(name)s %(message)s")
+# LOG_FORMAT=text (default) reproduces the format this module used to set
+# inline, so existing worker logs are unchanged; the cluster sets json.
+configure_logging("voice-worker")
 log = logging.getLogger(__name__)
 
 

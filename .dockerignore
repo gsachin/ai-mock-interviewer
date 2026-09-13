@@ -1,0 +1,43 @@
+# Version control and CI
+.git
+.github
+.gitignore
+.gitattributes
+
+# Python virtualenvs and caches (any depth)
+**/.venv
+**/venv
+**/__pycache__
+**/*.py[cod]
+**/.pytest_cache
+**/*.egg-info
+.mock_interviewer.egg-info
+
+# Rust/other build output
+**/target
+
+# Local model caches — never ship weights in the build context
+**/.cache
+**/models/*.onnx
+enterprise-rag-core/chroma_data
+chroma_data
+
+# Windows-only dev tooling and tunnel cache
+.tools
+.tunnel_*
+.interviewer_tunnel
+
+# Runtime output
+gate_results
+*.log
+
+# Docs and planning artifacts — not needed at runtime
+docs
+**/*.md
+!README.md
+
+# Test suite — runs in CI, not in the image
+tests
+
+# Streamlit remains in the repo but is not deployed (see US-002)
+# (web/streamlit_app.py is small and harmless; web/ is copied wholesale)

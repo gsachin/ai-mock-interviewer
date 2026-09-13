@@ -49,6 +49,14 @@ class InterviewerConfig:
     judge_model: str | None = None  # override the judge LLM model on the
                                 # same base URL (a faster model is a latency
                                 # lever; None = the configured llm_model)
+    # Static asset + content paths. Both default to None, meaning "resolve
+    # relative to the package as before" — so behaviour is unchanged on the
+    # Windows dev flow. Containers set them explicitly because server.py
+    # resolves web/ as Path(__file__).parent.parent / "web", which under a
+    # plain site-packages install points somewhere that does not exist and
+    # fails SILENTLY (the is_dir() guard), serving nothing with no error.
+    web_dir: str | None = None      # INTERVIEW_WEB_DIR — static UI folder
+    bank_dir: str | None = None     # INTERVIEW_BANK_DIR — question_banks folder
 
     @classmethod
     def from_env(cls, environ: dict[str, str] | None = None) -> "InterviewerConfig":
@@ -83,4 +91,6 @@ class InterviewerConfig:
             max_questions=int(env.get("INTERVIEW_MAX_QUESTIONS", "3")),
             answer_timeout_s=float(env.get("INTERVIEW_ANSWER_TIMEOUT_S", "60")),
             judge_model=env.get("INTERVIEW_JUDGE_MODEL"),
+            web_dir=env.get("INTERVIEW_WEB_DIR"),
+            bank_dir=env.get("INTERVIEW_BANK_DIR"),
         )

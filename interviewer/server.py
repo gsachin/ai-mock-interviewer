@@ -19,9 +19,15 @@ from pydantic import BaseModel
 
 from interviewer import skills
 from interviewer.config import InterviewerConfig
+from interviewer.logging_setup import configure_logging
 from interviewer.rag_client import RagClient
 from interviewer.state_machine import InterviewerState, Session
 from interviewer.voice import AGENT_NAME
+
+# This app previously configured no logging at all — uvicorn's defaults were
+# the only output. configure_logging is idempotent and text-by-default, so
+# local behaviour is unchanged.
+configure_logging("api")
 
 app = FastAPI(title="mock-interviewer", version="0.1.0")
 
@@ -163,7 +169,7 @@ async def list_skills() -> dict[str, Any]:
     ``rag_ok=false`` and ``registered`` stays null — never a 500."""
     rag_ok = True
     entries: list[dict[str, Any]] = []
-    for bank in skills.discover_local_banks(skills.BANK_DIR):
+    for bank in skills.discover_local_banks(skills.bank_dir()):
         sections, shape_error = _local_shape(bank)
         entry: dict[str, Any] = {
             "name": bank.name,
@@ -186,7 +192,7 @@ async def list_skills() -> dict[str, Any]:
         "rag_ok": rag_ok,
         "skills": entries,
         "unusable_files": [p.name
-                           for p in skills.unusable_bank_files(skills.BANK_DIR)],
+                           for p in skills.unusable_bank_files(skills.bank_dir())],
     }
 
 
@@ -216,7 +222,7 @@ async def upload_skill(file: UploadFile = File(...)) -> dict[str, Any]:
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
-    bank_dir = skills.BANK_DIR
+    bank_dir = skills.bank_dir()
     target = (bank_dir / f"{name}.md").resolve()
     if target.parent != bank_dir.resolve():
         raise HTTPException(status_code=400,
@@ -261,7 +267,7 @@ async def reconcile_skills() -> dict[str, Any]:
     register the ones with no registered questions (idempotent). Probes all
     banks BEFORE writing anything, so a RAG outage fails clean (502) with no
     partial registrations."""
-    banks = skills.discover_local_banks(skills.BANK_DIR)
+    banks = skills.discover_local_banks(skills.bank_dir())
     if not banks:
         return {"rag_ok": True, "registered": [], "already_present": [],
                 "errors": []}
@@ -314,6 +320,14 @@ async def reconcile_skills() -> dict[str, Any]:
 
 # The voice UI (web/index.html) is served from this app so the page and the
 # token endpoint share an origin (no CORS). API routes above take precedence.
-_web_dir = Path(__file__).resolve().parent.parent / "web"
+#
+# INTERVIEW_WEB_DIR overrides the location. The default resolves relative to
+# the package, which is correct in the repo AND in the image (both put the
+# source at a root with web/ beside it) but wrong under a plain site-packages
+# install — where the is_dir() guard below fails silently and the UI simply
+# does not appear. Containers set the variable explicitly so the failure mode
+# cannot happen.
+_web_dir = (Path(config.web_dir) if config.web_dir
+            else Path(__file__).resolve().parent.parent / "web")
 if _web_dir.is_dir():
     app.mount("/", StaticFiles(directory=str(_web_dir), html=True), name="web")

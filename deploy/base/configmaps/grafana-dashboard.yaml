@@ -1,0 +1,51 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: grafana-dashboard-mock-interviewer
+  namespace: mock-interviewer
+  labels:
+    app.kubernetes.io/part-of: mock-interviewer
+    # The Grafana sidecar convention: a ConfigMap carrying this label in the
+    # namespace the sidecar watches is imported as a dashboard with no manual
+    # step. On a Grafana without the sidecar this ConfigMap is inert — which is
+    # why it is small, and why nothing depends on it.
+    grafana_dashboard: "1"
+data:
+  mock-interviewer.json: |
+    {
+      "title": "Mock Interviewer — service health",
+      "uid": "mock-interviewer-health",
+      "schemaVersion": 39,
+      "editable": true,
+      "time": { "from": "now-6h", "to": "now" },
+      "panels": [
+        {
+          "type": "timeseries",
+          "title": "Scrape targets up",
+          "description": "The one panel here that works today: `up` exists for every scrape target Prometheus has, with no application support needed. A gap in this panel is the first thing to check before believing any panel below it.",
+          "gridPos": { "h": 8, "w": 12, "x": 0, "y": 0 },
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "up{job=~\".*mock-interviewer.*\"}",
+              "legendFormat": "{{instance}}"
+            }
+          ]
+        },
+        {
+          "type": "timeseries",
+          "title": "Voice turn latency (p95)",
+          "description": "Fed by the US-015 recording rule — empty until that story lands. Kept in the dashboard now so the panel definition and the alert share one expression.",
+          "gridPos": { "h": 8, "w": 12, "x": 12, "y": 0 },
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "mock_interviewer:voice_turn_latency:p95_5m",
+              "legendFormat": "p95"
+            }
+          ]
+        }
+      ]
+    }

@@ -1,0 +1,141 @@
+# ── Model prewarm (NFR-10 / DG-04) ──────────────────────────────────────────
+#
+# Run this once per model change, BEFORE (or instead of) waiting for the engines
+# to come up. It is not an optimisation: every engine in this component runs with
+# HF_HUB_OFFLINE=1, so a model that is not on the shared cache is a crashloop,
+# not a slow first request.
+#
+# Why a Job and not an initContainer on each engine:
+#   * An initContainer would run per replica and per restart. With four engines
+#     and an autoscaler, that is the same weights downloaded several times over —
+#     the exact thing DG-04 forbids (download per replica was the gap).
+#   * This Job asks for CPU and network, NOT for a GPU. It can therefore run,
+#     and finish, while the GPU pool is still being provisioned — which is the
+#     difference between "engines warm when nodes arrive" and "nodes arrive, then
+#     the download starts".
+#   * It is observable on its own: one Job, one log, one exit code. An initContainer
+#     failure is buried in whichever engine happened to start first.
+#
+# Idempotent by construction: `huggingface-cli download` skips blobs it already
+# has, so re-running after adding a model costs only the new model.
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: model-pull
+  namespace: mock-interviewer
+  labels:
+    app.kubernetes.io/part-of: mock-interviewer
+automountServiceAccountToken: false
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: model-pull
+  namespace: mock-interviewer
+  labels:
+    app.kubernetes.io/name: model-pull
+    app.kubernetes.io/component: engine
+    app.kubernetes.io/part-of: mock-interviewer
+spec:
+  backoffLimit: 3
+  # No ttlSecondsAfterFinished on purpose: the successful pod's log is the record
+  # of which model revisions are on the cache, and it is the first thing to look
+  # at when an engine cannot find its weights. Delete the Job when that stops
+  # being useful.
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: model-pull
+        app.kubernetes.io/component: engine
+        app.kubernetes.io/part-of: mock-interviewer
+    spec:
+      serviceAccountName: model-pull
+      automountServiceAccountToken: false
+      restartPolicy: Never
+      securityContext:
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: model-pull
+          # The vLLM image as the downloader, on purpose: it already ships
+          # huggingface_hub and the CLI, and — more importantly — using the same
+          # image that will READ the cache means the writer and the reader agree
+          # on the cache layout and the hub version. A separate `python:3-slim`
+          # plus `pip install` would introduce a second version of the library
+          # that decides where blobs go.
+          image: vllm/vllm-openai:latest
+          imagePullPolicy: IfNotPresent
+          command: ["/bin/sh", "-c"]
+          args:
+            # The model list comes from engine-endpoints.yaml, which is the same
+            # ConfigMap the engines read their `--model` from. That is what keeps
+            # "what got downloaded" and "what will be requested" from drifting —
+            # and with offline mode on, drift is a crashloop rather than a
+            # silent download.
+            #
+            # INTERVIEW_VOICE_LLM_MODEL and INTERVIEW_LLM_MODEL are the two
+            # served models; INTERVIEW_WHISPER_MODEL is the STT checkpoint. The
+            # Kokoro voice repo is named literally because nothing in the app
+            # config names it — Kokoro-FastAPI fetches its own model set, and
+            # this repo is the one MOD-07 records for the self-hosted weights.
+            - |
+              set -eu
+              echo "model cache -> ${HF_HOME}"
+              # snapshot_download via the Python API rather than the CLI: the
+              # CLI's name changed (`huggingface-cli` -> `hf`) within recent
+              # versions of the library, and a prewarm Job that dies because a
+              # command was renamed is a failure nobody should have to debug.
+              # This function has been the stable entry point for years.
+              python -c '
+              import os, sys
+              from huggingface_hub import snapshot_download
+              models = [
+                  os.environ["INTERVIEW_VOICE_LLM_MODEL"],
+                  os.environ["INTERVIEW_LLM_MODEL"],
+                  os.environ["INTERVIEW_WHISPER_MODEL"],
+                  # Named literally: no app config key names Kokoro's repo, and
+                  # this is the one MOD-07 records for the self-hosted weights.
+                  "hexgrad/Kokoro-82M",
+              ]
+              for m in models:
+                  print(f"==> {m}", flush=True)
+                  snapshot_download(m)
+              print("cache warm")
+              '
+          envFrom:
+            - configMapRef:
+                name: engine-endpoints
+          env:
+            # Same path and same variable as the engines (see their volumeMounts):
+            # HF_HOME is the one setting that decides where weights land, so it
+            # is set identically in the writer and the readers.
+            - name: HF_HOME
+              value: /models
+          resources:
+            requests:
+              cpu: 500m
+              memory: 1Gi
+            limits:
+              # Downloading and hashing tens of GB: bounded so the Job cannot
+              # disturb the nodes the engines are on, generous enough that the
+              # checksum pass is not the slow part.
+              memory: 4Gi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+          volumeMounts:
+            - name: model-cache
+              mountPath: /models
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: model-cache
+          persistentVolumeClaim:
+            claimName: model-cache
+        - name: tmp
+          emptyDir:
+            sizeLimit: 2Gi

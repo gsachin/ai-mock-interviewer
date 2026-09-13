@@ -1,0 +1,101 @@
+apiVersion: kustomize.config.k8s.io/v1alpha1
+kind: Component
+#
+# ============================================================================
+# GPU engines — THE ONE DELIBERATE DEVIATION FROM THE PLAN. READ THIS FIRST.
+# ============================================================================
+#
+# The plan (`05-modularization.md`, `MOD-13`, `US-019`) sketches the engines as
+# `base/engines/`, with the GPU plane living in `base/gpu/` and patches
+# switching between them. This tree instead puts BOTH engine planes in
+# `components/{cpu,gpu}-engines/`. The reasons, in order of weight:
+#
+#   1. A strategic-merge patch cannot convert `vllm-voice` into `ollama`. They
+#      are different images, different args, different env, different ports,
+#      different probes, different volumes and different health semantics. A
+#      "conversion patch" would be a whole resource wearing a patch's clothes —
+#      and it would live in the base, which is the thing that must stay
+#      portable. kustomize components exist for exactly this: a resource that
+#      differs per target, chosen by the target.
+#
+#   2. `base/engines/` would force every consumer of the base to inherit a GPU
+#      plane it cannot run. `overlays/local` is on kind: no GPU, no device
+#      plugin, no NVIDIA runtime. The rule this tree was built under — do not
+#      create resources the local cluster cannot run — is not satisfiable with
+#      a GPU Deployment in the base.
+#
+#   3. The two planes both need to PATCH the base (the worker's priority class,
+#      its engine endpoints), and a component can patch what a base declares.
+#      A base cannot patch another base.
+#
+# What did NOT change: everything else is still base. The API, the worker, the
+# SFU, the data tier and the policies are identical between the two targets, and
+# they must stay that way — the only thing that differs is which process serves
+# the model. That is the property a component preserves and a forked base loses.
+#
+# ----------------------------------------------------------------------------
+# Apply with: overlays/production (or any provider overlay). NOT with
+# overlays/local — the two engine components are mutually exclusive in
+# practice, and applying both gives you two engines per role with only one of
+# them named in engine-endpoints.yaml.
+#
+# This component is the EXPENSIVE, ENVIRONMENT-DEPENDENT one, and says so:
+#
+#   * It expects the cluster's NVIDIA device plugin and a node pool tainted
+#     `nvidia.com/gpu=present:NoSchedule` (NFR-3). Nothing here creates either.
+#   * The KEDA ScaledObjects need the KEDA operator's CRDs installed. Without
+#     them, `kubectl apply` fails with "no matches for kind ScaledObject" —
+#     which is why they are here and not in the base: the base has to apply to
+#     a cluster that has never heard of KEDA.
+#   * The vLLM/Whisper/Kokoro model weights come from the shared model-cache
+#     PVC, filled by the prewarm Job. The engines run with HF_HUB_OFFLINE=1, so
+#     a missing weight is a crashloop, not a slow download. Run the Job first.
+#   * GPU node cold start is 2–6 min of provisioning plus 1–5 min of model load
+#     (NFR-4). This is why three of the four engines have a floor of 1 replica:
+#     on GPU, elasticity means "grow beyond the floor", never "zero to N".
+#
+# ----------------------------------------------------------------------------
+# STILL OPEN, and not disguised as done: the EMBEDDING backend. The base sets
+# RAG_CORE_EMBED_BACKEND=ollama, and `ollama` is a CPU-component service — so
+# with this component applied, the RAG service's embedding calls name a service
+# that does not exist. That is deliberate rather than sloppy: MOD-05 leaves the
+# production embed story open (a second vLLM with `--task embed`, or a hosted
+# embedding API), and inventing one here would bake an unanswered design
+# question into a manifest. Options, in the order they should be considered:
+#   (a) a second vLLM Deployment in this component with `--task embed`;
+#   (b) an `ollama` Deployment moved into this component (it runs fine on CPU);
+#   (c) RAG_CORE_EMBED_BACKEND=<hosted> with a key from a Secret.
+# Until one is chosen, the RAG tier is not deployable on GPU-only infrastructure,
+# and the local overlay is the only target whose embedding path works end to end.
+resources:
+  - priorityclasses.yaml
+  - model-cache-pvc.yaml
+  - model-pull-job.yaml
+  - vllm-voice.yaml
+  - vllm-judge.yaml
+  - whisper.yaml
+  - kokoro.yaml
+  - keda-scaledobjects.yaml
+patches:
+  # ── The worker's priority class (NFR-10) ───────────────────────────────────
+  # This ONE field is the only thing the GPU plane changes about the worker, and
+  # it is why this patch is inline rather than a file: a one-line patch in a
+  # file of its own invites a reader to look for the rest of it.
+  #
+  # `mock-interviewer-voice-critical` makes the Cluster Autoscaler preempt lower
+  # priority pods — the judge first — when a voice pod needs a node. The worker
+  # is CPU-only and could run anywhere, so it is exactly the pod that gets
+  # squeezed out on a GPU-heavy cluster; the class says "not this one".
+  #
+  # Note it is NOT in the base: on a cluster with no priority classes defined
+  # (kind) the pod would be rejected at admission, and a base that only applies
+  # where a matching class happens to exist is not portable.
+  - target:
+      group: apps
+      version: v1
+      kind: Deployment
+      name: voice-worker
+    patch: |-
+      - op: add
+        path: /spec/template/spec/priorityClassName
+        value: mock-interviewer-voice-critical

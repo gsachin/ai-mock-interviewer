@@ -1,0 +1,100 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: engine-endpoints
+  namespace: mock-interviewer
+  labels:
+    app.kubernetes.io/part-of: mock-interviewer
+# Where the engines live.
+#
+# This file is the single place the local overlay has to touch to turn the
+# production engine plane into a CPU one, and it is deliberately shared by both
+# consumers — the app (INTERVIEW_*) and the RAG service (RAG_CORE_*) — because
+# "which engine" is one decision. Splitting it across two ConfigMaps is how the
+# two halves end up pointing at different engines, which is invisible until the
+# day someone changes one of them.
+#
+# These values describe the PRODUCTION target (base + components/gpu-engines),
+# so they name vllm-voice / whisper / kokoro: services that only exist when that
+# component is applied. Applied without it, the app starts and every engine call
+# fails — loud, and correct: the base is not a deployable target on its own.
+data:
+  # ── App: LLM ─────────────────────────────────────────────────────────────
+  # Production engines are vLLM, which serves HuggingFace checkpoints, so the
+  # models are named by their HF ids. The local overlay names the same models by
+  # their Ollama tags (qwen2.5:14b, llama3.2:3b). Keep the two in step: they are
+  # the same models, and a divergence here is how the laptop and the cluster
+  # quietly start testing different things.
+  #
+  # vllm-JUDGE, not vllm-voice, and the split is the one MOD-05 exists for.
+  # `llm_base_url` is the NON-voice LLM: question generation plus every judge
+  # call (voice/interviewer.py builds its judge LLM from llm_base_url; the
+  # realtime turn model comes from voice_llm_base_url below). It is also the
+  # server that serves the 14B, so the model name and the service now agree.
+  #
+  # The cost of that split, stated rather than discovered: vllm-judge has
+  # minReplicas 0, so its first call after a quiet period pays a model load.
+  # That is tolerable for scoring (MOD-13: "a slower score, not a failed
+  # interview") and is a real consideration for a session's first question —
+  # if a cold start there ever becomes visible to a candidate, the fix is
+  # minReplicas 1 on vllm-judge, not a config edit.
+  INTERVIEW_LLM_BASE_URL: "http://vllm-judge:8000/v1"
+  INTERVIEW_LLM_MODEL: "Qwen/Qwen2.5-14B-Instruct"
+  # Empty = inherit INTERVIEW_LLM_MODEL, which is now correct rather than
+  # accidental: the judge model and the management model are the same model on
+  # the same server. Worth knowing before you set it — judge_model overrides the
+  # model NAME only, on the SAME base URL (config.py), so it can pick a
+  # different model on vllm-judge but it cannot route judging to a different
+  # SERVER. A dedicated judge endpoint needs a base-URL key that does not exist.
+  INTERVIEW_JUDGE_MODEL: ""
+
+  # ── App: hot-path voice LLM + STT + TTS ──────────────────────────────────
+  # The voice model is deliberately not the judge model: a fast small model on
+  # the hot path, a slower one for judging off it (Phase 3 split).
+  INTERVIEW_VOICE_LLM_BASE_URL: "http://vllm-voice:8000/v1"
+  INTERVIEW_VOICE_LLM_MODEL: "Qwen/Qwen2.5-7B-Instruct-AWQ"
+  # The `-http` provider names are the remote engine adapters of US-011. Until
+  # that story lands the worker selects its IN-PROCESS engines instead
+  # (faster-whisper / kokoro), which is exactly what the local overlay sets —
+  # the worker image still carries those models (see the Dockerfile's worker
+  # target), so the adapter flip is a provider-name change and nothing else.
+  INTERVIEW_STT_PROVIDER: "whisper-http"
+  INTERVIEW_STT_BASE_URL: "http://whisper:8000/v1"
+  INTERVIEW_WHISPER_MODEL: "Systran/faster-whisper-base"
+  INTERVIEW_TTS_PROVIDER: "kokoro-http"
+  INTERVIEW_TTS_BASE_URL: "http://kokoro:8880/v1"
+  INTERVIEW_KOKORO_VOICE: "af_heart"
+
+  # ── RAG service's own engine stack ───────────────────────────────────────
+  # The search tier (Qdrant, Elasticsearch, MinIO) is NOT part of this
+  # deliverable — DG-03 and US-017 own it — so with base + gpu-engines applied
+  # these URLs name services that do not exist yet and the rag Deployment will
+  # not become Ready. That is stated rather than hidden, and it is why the local
+  # overlay replaces all three backends with in-process ones.
+  RAG_CORE_VECTOR_BACKEND: "qdrant"
+  RAG_CORE_QDRANT_URL: "http://qdrant:6333"
+  RAG_CORE_KEYWORD_BACKEND: "elasticsearch"
+  # RAG_CORE_ES_URL, not RAG_CORE_ELASTICSEARCH_URL — the latter (used by
+  # docker-compose.yml) is not read by enterprise_rag/config.py, and with
+  # keyword_backend=elasticsearch an unset RAG_CORE_ES_URL is a hard startup
+  # error. Worth fixing in the compose file separately.
+  RAG_CORE_ES_URL: "http://elasticsearch:9200"
+  # The semantic cache is off in the base. Enabling it needs its OWN Redis
+  # instance: pointed at redis-sessions, a session-store FLUSH would evict the
+  # RAG cache and vice versa, which is the coupling the compose file's own
+  # comment warns about and NFR-17 argues against. see the rag egress rule.
+  RAG_CORE_CACHE_BACKEND: "none"
+  # Only used when the vector backend is chroma, which is the local overlay's
+  # choice; the base keeps it set so switching back is one key.
+  RAG_CORE_CHROMA_PATH: "/var/lib/rag/chroma"
+
+  # ── Embeddings ───────────────────────────────────────────────────────────
+  # Pinned rather than `auto`: auto sniffs for an NVIDIA marker and silently
+  # switches to vllm on a GPU node, which is the kind of environment-dependent
+  # boot behaviour that is impossible to reproduce locally. ollama is the one
+  # backend that runs on every target. The production embed story (a second vLLM
+  # with --task embed, or a hosted embedding API) is an open decision in MOD-05,
+  # not something to guess at here.
+  RAG_CORE_EMBED_BACKEND: "ollama"
+  OLLAMA_URL: "http://ollama:11434"
+  EMBED_MODEL: "nomic-embed-text"

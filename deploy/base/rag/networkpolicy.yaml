@@ -1,0 +1,111 @@
+# kindnet does not enforce NetworkPolicy — see the warning in
+# base/networkpolicy.yaml. These rules are syntax-checked locally and nothing
+# more.
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: rag-ingress
+  namespace: mock-interviewer
+  labels:
+    app.kubernetes.io/part-of: mock-interviewer
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: rag
+  policyTypes:
+    - Ingress
+  ingress:
+    # 8031 is reachable from the components that retrieve: the worker on the
+    # voice path and the API for /skills. Nothing else, and deliberately not
+    # "the whole namespace" — an MCP endpoint with no auth on any route is the
+    # compensating control here (BRD-17 is deferred, so the network is the
+    # boundary), which means the allow list is the security boundary and should
+    # stay enumerable by hand.
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: api
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: voice-worker
+      ports:
+        - port: 8031
+          protocol: TCP
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: rag-egress
+  namespace: mock-interviewer
+  labels:
+    app.kubernetes.io/part-of: mock-interviewer
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: rag
+  policyTypes:
+    - Egress
+  egress:
+    # ── Embeddings / reranking ──────────────────────────────────────────────
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/component: engine
+      ports:
+        - port: 11434
+          protocol: TCP
+        - port: 8000
+          protocol: TCP
+        - port: 8880
+          protocol: TCP
+    # ── Session store ───────────────────────────────────────────────────────
+    # RAG_CORE_CACHE_BACKEND is "none" in this base (see engine-endpoints.yaml),
+    # so nothing uses this today. It is here anyway because the alternative is a
+    # connection timeout with no policy to point at on the day the semantic
+    # cache is turned on — and because the RAG service is the component whose
+    # storage story is still moving (US-010 object store, US-017 local
+    # backends). When RAG gets its own Redis, change the selector here: that
+    # edit is exactly the review you want to be forced into.
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: redis-sessions
+      ports:
+        - port: 6379
+          protocol: TCP
+    # ── Search tier ─────────────────────────────────────────────────────────
+    # These pods do not exist in this deliverable (DG-03/US-017 own the
+    # Qdrant/Elasticsearch/MinIO manifests, and the local overlay replaces all
+    # three with in-process chroma + bm25). A rule naming a pod that does not
+    # exist is inert, not broken — and it is the difference between "the search
+    # tier landed and RAG talks to it" and "the search tier landed and every
+    # retrieval times out until someone remembers this file exists".
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: qdrant
+      ports:
+        - port: 6333
+          protocol: TCP
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: elasticsearch
+      ports:
+        - port: 9200
+          protocol: TCP
+    # DNS, same reasoning as everywhere else in this tree: the rules above match
+    # IPs, the app dials names.
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - port: 53
+          protocol: UDP
+        - port: 53
+          protocol: TCP

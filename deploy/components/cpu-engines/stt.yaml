@@ -1,0 +1,164 @@
+# ── Speaches (STT) — CPU ────────────────────────────────────────────────────
+#
+# OpenAI-compatible transcription at /v1/audio/transcriptions, which is why the
+# app's remote STT adapter (US-011) is a base-URL change rather than a new
+# client. The same image has a GPU variant; the app cannot tell them apart,
+# which is the property that makes "test locally, deploy to GPU" honest.
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: stt
+  namespace: mock-interviewer
+  labels:
+    app.kubernetes.io/part-of: mock-interviewer
+automountServiceAccountToken: false
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: stt
+  namespace: mock-interviewer
+  labels:
+    app.kubernetes.io/name: stt
+    app.kubernetes.io/component: engine
+    app.kubernetes.io/part-of: mock-interviewer
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: stt
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: stt
+        app.kubernetes.io/component: engine
+        app.kubernetes.io/part-of: mock-interviewer
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8000"
+        prometheus.io/path: "/metrics"
+    spec:
+      serviceAccountName: stt
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: 60
+      securityContext:
+        # Upstream image, unverifiable uid: identity-independent hardening only,
+        # same reasoning as ollama and livekit.
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: stt
+          image: ghcr.io/speaches-ai/speaches:latest-cpu
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8000
+          env:
+            # Double underscore for the nested setting — Speaches' convention.
+            # The model id is a HuggingFace repo, not an ollama tag: this engine
+            # downloads from HF (see the cache volume below).
+            - name: WHISPER__MODEL
+              value: "Systran/faster-whisper-base"
+            # Pin the device rather than letting it detect: on a CPU node the
+            # detection path is exercised for nothing, and pinning makes the
+            # local behaviour reproducible.
+            - name: WHISPER__DEVICE
+              value: "cpu"
+          # ── Probes ────────────────────────────────────────────────────────
+          # /v1/models, not /health: it is part of the OpenAI-compatible surface
+          # the app actually calls, so it is guaranteed to describe "can this
+          # thing serve", and it does not depend on a health route that varies
+          # between Speaches versions.
+          startupProbe:
+            httpGet:
+              path: /v1/models
+              port: http
+            periodSeconds: 10
+            failureThreshold: 90 # 15 min: first boot downloads the model
+          livenessProbe:
+            httpGet:
+              path: /v1/models
+              port: http
+            periodSeconds: 20
+            timeoutSeconds: 5
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /v1/models
+              port: http
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+          resources:
+            requests:
+              cpu: 500m
+              memory: 1Gi
+            limits:
+              memory: 4Gi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+          volumeMounts:
+            - name: hf-cache
+              mountPath: /home/ubuntu/.cache/huggingface
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        # emptyDir rather than a PVC, and the trade is explicit: the base model
+        # is ~150 MB, so a re-download after a restart costs a minute, whereas a
+        # PVC provisioned root-owned under a non-root container costs a crashloop
+        # and a debugging session. emptyDir is 0777, so the image's own uid can
+        # write to it whatever that uid turns out to be.
+        - name: hf-cache
+          emptyDir:
+            sizeLimit: 4Gi
+        - name: tmp
+          emptyDir:
+            sizeLimit: 1Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: stt
+  namespace: mock-interviewer
+  labels:
+    app.kubernetes.io/name: stt
+    app.kubernetes.io/component: engine
+    app.kubernetes.io/part-of: mock-interviewer
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: stt
+  ports:
+    - name: http
+      port: 8000
+      targetPort: http
+      protocol: TCP
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: stt-ingress
+  namespace: mock-interviewer
+  labels:
+    app.kubernetes.io/part-of: mock-interviewer
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: stt
+  policyTypes:
+    - Ingress
+  ingress:
+    # Only the worker transcribes. The API does not touch STT, and allowing it
+    # "because it might one day" is how a policy stops describing the system.
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: voice-worker
+      ports:
+        - port: 8000
+          protocol: TCP

@@ -1,0 +1,52 @@
+# Cluster-scoped, and deliberately namespace-free: PriorityClass is not a
+# namespaced resource and the base kustomization does not use a `namespace:`
+# transformer (see base/kustomization.yaml), so nothing stamps these.
+#
+# Their job (NFR-10) is to tell the Cluster Autoscaler whose capacity matters
+# when it has to take a node away from someone. Two classes, and the asymmetry
+# between them is the whole design: everything serving a live candidate is
+# critical, and the judge is the only workload that can safely yield.
+---
+apiVersion: scheduling.k8s.io/v1
+kind: PriorityClass
+metadata:
+  name: mock-interviewer-voice-critical
+  labels:
+    app.kubernetes.io/part-of: mock-interviewer
+# High, and specifically below the system classes (system-cluster-critical is
+# 2000000000) — a workload that outranks the kubelet's own pods is a workload
+# that can wedge a node it is being evicted from.
+value: 1000000
+globalDefault: false
+# PreemptLowerPriority, not Never: the entire point of this class is that a
+# pending voice pod may push a lower-priority pod off a node. `Never` would make
+# it a label with no effect.
+#
+# What preemption is NOT: it does not evict through the PDB, and it does not
+# touch other namespaces' `mock-interviewer-voice-critical`-equivalent pods
+# unless they are lower priority. Priority is a tie-breaker for scheduling, not
+# a guarantee — a saturated GPU pool still leaves the pod Pending.
+preemptionPolicy: PreemptLowerPriority
+description: >-
+  Live-candidate path: the voice worker and the engines that serve an interview
+  in progress. Preempts lower-priority pods so a voice replica can schedule.
+---
+apiVersion: scheduling.k8s.io/v1
+kind: PriorityClass
+metadata:
+  name: mock-interviewer-batch-low
+  labels:
+    app.kubernetes.io/part-of: mock-interviewer
+# Low, not negative: negative values are reserved for pods that should never be
+# scheduled on a contended cluster at all. 100 is "yields to everything that
+# matters, still schedulable on an idle cluster".
+value: 100
+globalDefault: false
+# Never: the judge must not evict a running interview to get a node. It waits,
+# which is the correct behaviour for the one workload in the system that is
+# explicitly allowed to be slow (MOD-13: a cold judge is "a slower score, not a
+# failed interview").
+preemptionPolicy: Never
+description: >-
+  Off-hot-path batch work: vllm-judge. Yields nodes to the voice path and never
+  preempts anything itself.

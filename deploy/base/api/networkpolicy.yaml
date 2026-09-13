@@ -1,0 +1,108 @@
+# kindnet does not enforce NetworkPolicy — see the warning in
+# base/networkpolicy.yaml. These rules are syntax-checked locally and nothing
+# more.
+---
+# ── Ingress: the ingress controller, and nothing else ───────────────────────
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: api-ingress
+  namespace: mock-interviewer
+  labels:
+    app.kubernetes.io/part-of: mock-interviewer
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: api
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        # The ingress namespace, matched by the label the API server sets on
+        # every namespace (kubernetes.io/metadata.name) so it cannot drift from
+        # the real name. If your controller lives elsewhere, this is the line to
+        # change.
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: ingress-nginx
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: ingress-nginx
+      ports:
+        - port: 8010
+          protocol: TCP
+  # Kubelet probes and Prometheus scrapes are allowed namespace-wide by
+  # base/networkpolicy.yaml — they are not repeated per workload.
+---
+# ── Egress ──────────────────────────────────────────────────────────────────
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: api-egress
+  namespace: mock-interviewer
+  labels:
+    app.kubernetes.io/part-of: mock-interviewer
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: api
+  policyTypes:
+    - Egress
+  egress:
+    # Declaring Egress here makes this pod egress-isolated: everything not
+    # listed is denied. That is the intent, and it is why DNS is the first rule
+    # (see below) and why the list is short.
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: rag
+      ports:
+        - port: 8031
+          protocol: TCP
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: redis-sessions
+      ports:
+        - port: 6379
+          protocol: TCP
+    # ── The LLM, and why this is selected by LABEL ──────────────────────────
+    # The API is not only a session store and a token minter: its session routes
+    # run the interview brain, which generates questions and judges answers over
+    # INTERVIEW_LLM_BASE_URL. Without this rule the API can read and write
+    # sessions but cannot ask a question — a failure that looks like an engine
+    # problem from every log except this file.
+    #
+    # `app.kubernetes.io/component: engine` rather than a service name, because
+    # the engine set is the one thing that changes per target: ollama on CPU,
+    # vllm-judge (and vllm-voice) on GPU. Two ports, one rule, both planes — and
+    # a component that adds an engine does not have to remember to edit the API.
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/component: engine
+      ports:
+        - port: 11434 # ollama — the CPU plane's LLM
+          protocol: TCP
+        - port: 8000 # vllm-judge / vllm-voice — the GPU plane's LLM
+          protocol: TCP
+    # There is deliberately no rule to LiveKit. /voice/token MINTS a JWT with
+    # the shared secret — it is a local signing operation, not a call to the
+    # SFU — and the worker is what connects. Adding an unused allowance here
+    # would hide the day someone adds a real RoomService call.
+    - to:
+        # DNS. Omitting this is the classic self-inflicted network outage: every
+        # rule in this file is matched on an IP, but the app resolves
+        # `rag:8031` by name, so with no DNS the failure looks like the rag
+        # service being down while its pods are perfectly healthy.
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - port: 53
+          protocol: UDP
+        - port: 53
+          protocol: TCP

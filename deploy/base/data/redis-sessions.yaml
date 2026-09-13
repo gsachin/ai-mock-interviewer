@@ -1,0 +1,185 @@
+# ── Session store ───────────────────────────────────────────────────────────
+#
+# One of TWO Redis instances, and the separation is the design (NFR-17): the
+# session store has no graceful degradation — a scale event or an outage here is
+# an outage for the API's session routes — so it must not share fate with the
+# SFU's coordination state. The reverse is also true: an SFU incident must not
+# be able to take session state with it. Two Deployments, two Services, two
+# names, no shared volume.
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: redis-sessions-data
+  namespace: mock-interviewer
+  labels:
+    app.kubernetes.io/name: redis-sessions
+    app.kubernetes.io/part-of: mock-interviewer
+spec:
+  # No storageClassName. Deliberately. A hardcoded class is exactly the thing
+  # that makes a base non-portable (BRD-14), so this PVC asks the target cluster
+  # for its default class and the provider overlays supply a named one if the
+  # default is not what they want. kind ships local-path-provisioner as the
+  # default, so this binds locally with no configuration.
+  #
+  # ReadWriteOnce: a single-replica Redis with two writers needs cluster-aware
+  # Redis (Sentinel or Cluster), not a shared volume. If this tier ever needs
+  # HA, that is a different topology, not a different access mode.
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 1Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: redis-sessions
+  namespace: mock-interviewer
+  labels:
+    app.kubernetes.io/name: redis-sessions
+    app.kubernetes.io/component: cache
+    app.kubernetes.io/part-of: mock-interviewer
+spec:
+  # Not a StatefulSet, and that is a deliberate simplification rather than an
+  # oversight: identity and stable network names buy nothing for a single
+  # instance whose only consumer reaches it through a Service. If this becomes a
+  # real HA concern it becomes a StatefulSet or a managed service — both are
+  # clearer than a Deployment pretending to be one.
+  replicas: 1
+  strategy:
+    # A session store cannot do a rolling update with one replica: Recreate is
+    # the honest description of what happens (sessions are lost on restart, and
+    # pretending otherwise with maxUnavailable: 0 would just hang the rollout).
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: redis-sessions
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: redis-sessions
+        app.kubernetes.io/component: cache
+        app.kubernetes.io/part-of: mock-interviewer
+      annotations:
+        prometheus.io/scrape: "true"
+        # redis_exporter is not deployed here; the ports and paths are recorded
+        # so the scrape side is right when it is. Redis itself does not speak
+        # the Prometheus exposition format — the annotation alone will 404.
+        prometheus.io/port: "6379"
+        prometheus.io/path: "/metrics"
+    spec:
+      serviceAccountName: redis-sessions
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: 30
+      securityContext:
+        # Same reasoning as livekit: upstream image, no user we can assert, so
+        # the identity-independent controls are set and runAsNonRoot is left to
+        # the overlay that picks the image deliberately.
+        seccompProfile:
+          type: RuntimeDefault
+        # NOT cosmetic. The official redis entrypoint chowns its data dir when
+        # it starts as root, but `capabilities.drop: [ALL]` removes CAP_CHOWN,
+        # so that chown fails with "Operation not permitted" and the container
+        # crash-loops before redis ever starts. Running as the image's own
+        # redis uid (999) makes the entrypoint skip the chown branch, and
+        # fsGroup makes the volume writable for it. Found by deploying: the
+        # manifest was valid and applied cleanly.
+        runAsUser: 999
+        runAsGroup: 999
+        fsGroup: 999
+      containers:
+        - name: redis
+          image: redis:7.4-alpine
+          imagePullPolicy: IfNotPresent
+          args:
+            # appendonly on: the point of the PVC above. Sessions are the one
+            # piece of state in this tree that cannot be rebuilt from an image,
+            # so a Redis restart should not silently discard every live
+            # interview's progress. Plain RDB snapshots (`--save`) are the
+            # alternative; AOF is the safer default for a small keyspace.
+            - "redis-server"
+            - "--appendonly"
+            - "yes"
+            - "--appendfsync"
+            - "everysec"
+            - "--maxmemory"
+            - "512mb"
+            # allkeys-lru pairs with maxmemory so the store degrades by evicting
+            # the coldest session instead of starting to reject writes — a
+            # rejected write is a failed session, an evicted one is a
+            # re-prompt.
+            - "--maxmemory-policy"
+            - "allkeys-lru"
+          ports:
+            - name: redis
+              containerPort: 6379
+          # Probes use redis-cli rather than a TCP connect: an open port proves
+          # nothing about a Redis that is loading its AOF file, and a readiness
+          # probe that lies here hands the API a store that cannot answer.
+          startupProbe:
+            exec:
+              command: ["redis-cli", "ping"]
+            periodSeconds: 5
+            failureThreshold: 30
+          livenessProbe:
+            exec:
+              command: ["redis-cli", "ping"]
+            periodSeconds: 15
+            timeoutSeconds: 3
+            failureThreshold: 3
+          readinessProbe:
+            exec:
+              command: ["redis-cli", "ping"]
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 2
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              # maxmemory above (512mb) is the application-level ceiling and is
+              # the one that matters for eviction behaviour; the container limit
+              # is deliberately higher so that the eviction policy takes effect
+              # before the kernel OOM-kills the process. A container limit at or
+              # below maxmemory would turn "full cache" into "dead Redis".
+              cpu: 500m
+              memory: 768Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+          volumeMounts:
+            - name: data
+              mountPath: /data
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: redis-sessions-data
+        - name: tmp
+          emptyDir:
+            sizeLimit: 64Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: redis-sessions
+  namespace: mock-interviewer
+  labels:
+    app.kubernetes.io/name: redis-sessions
+    app.kubernetes.io/component: cache
+    app.kubernetes.io/part-of: mock-interviewer
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: redis-sessions
+  ports:
+    - name: redis
+      port: 6379
+      targetPort: redis
+      protocol: TCP

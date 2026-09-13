@@ -1,0 +1,49 @@
+# ════════════════════════════════════════════════════════════════════════════
+#  READ THIS BEFORE "FIXING" SLOW SCALE-DOWN.
+#
+#  A PodDisruptionBudget DOES NOT PROTECT AGAINST A KEDA SCALE-DOWN.
+#
+#  KEDA reduces replicas through the SCALE SUBRESOURCE. That path deletes pods
+#  directly and never touches the eviction API — which is the only place a PDB
+#  is enforced. So when KEDA decides a worker is surplus, the pod goes, PDB or
+#  not, and a PDB with minAvailable: 1 will happily sit at "disruptionsAllowed:
+#  1" while a live interview is being terminated.
+#
+#  What this PDB actually covers: node drains, cluster upgrades, and any other
+#  eviction-API path. Those are real events worth budgeting for — a node drain
+#  that evicts every worker at once is a bad afternoon — so this file earns its
+#  place.
+#
+#  What actually protects an interview is the other two-thirds of NFR-6:
+#      preStop  (drains the worker, US-014)  +  terminationGracePeriodSeconds: 900
+#  plus maxUnavailable: 0 on the Deployment so an ordinary rollout never removes
+#  capacity before its replacement is serving.
+#
+#  The failure mode to avoid is a team that observes slow scale-down, traces it
+#  to this object's budget, and loosens the PDB to "make scaling snappier". That
+#  fixes nothing (KEDA was never consulting it) and removes the only protection
+#  node drains had. If scale-down is slow, the thing to look at is the drain
+#  implementation and the 900 s grace period, not this file.
+# ════════════════════════════════════════════════════════════════════════════
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: voice-worker
+  namespace: mock-interviewer
+  labels:
+    app.kubernetes.io/name: voice-worker
+    app.kubernetes.io/component: voice-worker
+    app.kubernetes.io/part-of: mock-interviewer
+spec:
+  # minAvailable: 1 rather than a percentage: the point is that a drain cannot
+  # take the last worker, and with a fleet this size a percentage is just a
+  # confusing way of writing "at least one" (20% of 1 replica rounds to 0).
+  #
+  # Local note: overlays/local runs a single worker replica, so this budget
+  # blocks eviction of that pod entirely and a `kubectl drain` will appear to
+  # hang. That is the budget doing its job, not a bug — drain with
+  # --disable-eviction if you are deliberately tearing the node down.
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: voice-worker

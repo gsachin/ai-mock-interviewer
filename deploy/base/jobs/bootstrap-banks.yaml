@@ -1,0 +1,112 @@
+# ── Question-bank bootstrap ─────────────────────────────────────────────────
+#
+# WHAT THIS JOB ACTUALLY DOES TODAY, STATED HONESTLY:
+#
+# It VERIFIES the bank set baked into the image rather than seeding anything.
+# The intent behind this file is the seeder — the 9 banks under question_banks/
+# (26,710 bytes total) are content, not code, and content belongs in a ConfigMap
+# or an object store rather than frozen into an image layer. That source does
+# not exist yet: the intended mechanism is a ConfigMap generator over
+# `question_banks/*.md`, and where that generator can live is constrained by
+# kustomize's load restrictor — `files: ../../question_banks/*.md` from
+# anywhere inside deploy/ does not build without relaxing the restrictor, so the
+# generator has to sit at the repository root, above this tree. That is a
+# deliberate design decision still to be made (US-009/US-010 own the bank store,
+# US-010 moves the source of truth to object storage), not something to fake
+# here.
+#
+# So this Job does the thing that is true today and worth having: it asserts the
+# image contains exactly the committed bank set. That is not busywork — question
+# banks WERE silently excluded from the image by .dockerignore once already
+# (commit 9183d4b), and the failure mode of that bug is a UI that renders and
+# serves an interview with zero questions and no error anywhere. This Job turns
+# that class of bug into a red pod.
+#
+# When the ConfigMap generator lands (or US-010 makes the object store the
+# source), this Job grows a second container that copies the banks into the
+# worker's cache path — and this comment is the thing to delete.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: bootstrap-banks
+  namespace: mock-interviewer
+  labels:
+    app.kubernetes.io/name: bootstrap-banks
+    app.kubernetes.io/component: batch
+    app.kubernetes.io/part-of: mock-interviewer
+spec:
+  backoffLimit: 2
+  # Cleanup: a finished Job's pod is noise, and the object itself is kept long
+  # enough to read its logs after a deploy.
+  ttlSecondsAfterFinished: 86400
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: bootstrap-banks
+        app.kubernetes.io/component: batch
+        app.kubernetes.io/part-of: mock-interviewer
+    spec:
+      restartPolicy: Never
+      serviceAccountName: bootstrap-banks
+      automountServiceAccountToken: false
+      securityContext:
+        # Same profile as the API: this runs the API image, so it is the same
+        # uid the image declares.
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: verify-banks
+          image: mock-interviewer-api:dev
+          imagePullPolicy: IfNotPresent
+          command: ["python", "-c"]
+          args:
+            - |
+              import pathlib, sys
+
+              root = pathlib.Path("/app/question_banks")
+              banks = sorted(root.glob("*.md"))
+              total = sum(p.stat().st_size for p in banks)
+
+              # Both numbers move together when the bank set changes. They are
+              # pinned on purpose: a shrink that nobody meant to make is the bug
+              # this Job exists to catch, and a count-only check would miss a
+              # truncated file. Update them in the same commit as the banks.
+              EXPECTED_BANKS = 9
+              EXPECTED_BYTES = 26710
+
+              print(f"bank dir: {root}")
+              print(f"found: {len(banks)} banks, {total} bytes")
+              for p in banks:
+                  print(f"  {p.name}: {p.stat().st_size} bytes")
+
+              if (len(banks), total) != (EXPECTED_BANKS, EXPECTED_BYTES):
+                  print(
+                      f"FAIL: expected {EXPECTED_BANKS} banks / {EXPECTED_BYTES} bytes, "
+                      f"found {len(banks)} / {total}. The bank content is baked into "
+                      f"the image (see the Dockerfile) and has been excluded by "
+                      f".dockerignore before now — check that first.",
+                      file=sys.stderr,
+                  )
+                  sys.exit(1)
+
+              print("OK: the committed bank set is present in the image.")
+          resources:
+            requests:
+              cpu: 50m
+              memory: 128Mi
+            limits:
+              cpu: 200m
+              memory: 256Mi
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 10001
+            runAsGroup: 10001
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL

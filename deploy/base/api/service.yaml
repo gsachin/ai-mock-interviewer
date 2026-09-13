@@ -1,0 +1,37 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: api
+  namespace: mock-interviewer
+  labels:
+    app.kubernetes.io/name: api
+    app.kubernetes.io/component: management-api
+    app.kubernetes.io/part-of: mock-interviewer
+spec:
+  # ClusterIP, deliberately, and this is the portable choice rather than a
+  # local shortcut:
+  #   * kind has no load-balancer provider, so a LoadBalancer Service would sit
+  #     <pending> forever (a resource the local cluster cannot run, in the sense
+  #     that matters);
+  #   * the base carries NO cloud LB annotations (BRD-14) — those are exactly
+  #     the four sanctioned overlay knobs in US-019.
+  #
+  # Locally, reach the UI and the API with:
+  #     kubectl port-forward -n mock-interviewer svc/api 8010:8010
+  #
+  # The Ingress is a separate work item and is NOT part of this tree: NFR-9
+  # requires proxy-buffering off plus 3600 s read/send timeouts on the LiveKit
+  # route, and getting those wrong is worse than having no ingress at all
+  # (a buffering proxy delivers WebRTC frames late, which is broken audio that
+  # no application metric can see). kind-config.yaml already reserves host ports
+  # 8088/8443 for it. networkpolicy.yaml already allows the ingress controller
+  # to reach this port, so that first deploy after the ingress lands does not
+  # fail closed.
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: api
+  ports:
+    - name: http
+      port: 8010
+      targetPort: http
+      protocol: TCP

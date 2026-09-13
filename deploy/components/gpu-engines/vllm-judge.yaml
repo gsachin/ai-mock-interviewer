@@ -1,0 +1,211 @@
+# ── vllm-judge — the non-voice LLM (MOD-05) ─────────────────────────────────
+#
+# The other half of the vLLM split, and the ONLY workload in this tree with a
+# low priority class and a floor of zero. Both of those are the same statement:
+# this is the one thing that can safely yield a node to a live interview
+# (NFR-10), and the one thing whose absence degrades rather than breaks the
+# product — MOD-13: "a cold judge is a slower score, not a failed interview".
+#
+# It serves two callers that are easy to conflate: the judge itself (the rubric
+# evaluation after an answer) and the API's MANAGEMENT LLM (question
+# generation). Both go through INTERVIEW_LLM_BASE_URL, which is why that key
+# points here rather than at vllm-voice.
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: vllm-judge
+  namespace: mock-interviewer
+  labels:
+    app.kubernetes.io/part-of: mock-interviewer
+automountServiceAccountToken: false
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: vllm-judge
+  namespace: mock-interviewer
+  labels:
+    app.kubernetes.io/name: vllm-judge
+    app.kubernetes.io/component: engine
+    app.kubernetes.io/part-of: mock-interviewer
+spec:
+  # No `replicas:` — the ScaledObject owns it, and its minReplicaCount is 0. Do
+  # not "fix" that by adding replicas here: two writers on spec.replicas is NFR-2.
+  revisionHistoryLimit: 3
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: vllm-judge
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: vllm-judge
+        app.kubernetes.io/component: engine
+        app.kubernetes.io/part-of: mock-interviewer
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8000"
+        prometheus.io/path: "/metrics"
+    spec:
+      serviceAccountName: vllm-judge
+      automountServiceAccountToken: false
+      # LOW, and the asymmetry with vllm-voice is the design: when the Cluster
+      # Autoscaler needs a node for a voice replica, this pod is the one it may
+      # take it from. preemptionPolicy Never (see priorityclasses.yaml) means it
+      # never takes a node from anyone.
+      priorityClassName: mock-interviewer-batch-low
+      tolerations:
+        - key: nvidia.com/gpu
+          operator: Equal
+          value: present
+          effect: NoSchedule
+      securityContext:
+        seccompProfile:
+          type: RuntimeDefault
+      terminationGracePeriodSeconds: 60
+      containers:
+        - name: vllm-judge
+          image: vllm/vllm-openai:latest
+          imagePullPolicy: IfNotPresent
+          command: ["/bin/sh", "-c"]
+          args:
+            # ── What is deliberately DIFFERENT from vllm-voice ──────────────
+            # No `--enable-prefix-caching`. Prefix caching pays for a long shared
+            # prefix (the voice system prompt and rubric); the judge's prompts
+            # are one answer plus a rubric and vary per question, so the cache
+            # would mostly consume KV memory this server wants for batching.
+            #
+            # Everything else is left at the defaults, which ARE the batching
+            # configuration: continuous batching and 256 sequences in flight are
+            # what "aggressive batching" means in MOD-05, and re-specifying them
+            # by hand only creates a number to drift.
+            #
+            # `exec` for SIGTERM, same as vllm-voice.
+            - |
+              exec python3 -m vllm.entrypoints.openai.api_server \
+                --host 0.0.0.0 \
+                --port 8000 \
+                --model "${INTERVIEW_LLM_MODEL}" \
+                --gpu-memory-utilization 0.90
+          ports:
+            - name: http
+              containerPort: 8000
+          envFrom:
+            - configMapRef:
+                name: engine-endpoints
+          env:
+            - name: HF_HOME
+              value: /models
+            - name: HF_HUB_OFFLINE
+              value: "1"
+          # Startup only, no liveness, no readiness — BRD-02's GPU exemption, as
+          # on vllm-voice.
+          #
+          # 180 × 10 s = 30 minutes rather than the voice model's 20, because
+          # this server loads the 14B: more weights off a network filesystem,
+          # more CUDA graph capture, and — with minReplicas 0 — that load
+          # happens on the first call after a quiet period, when nothing else is
+          # keeping the pod warm. A timeout here would mean a scale-to-zero
+          # judge could never come back up.
+          startupProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 10
+            failureThreshold: 180
+          resources:
+            requests:
+              cpu: 2
+              memory: 12Gi
+              nvidia.com/gpu: 1
+            limits:
+              nvidia.com/gpu: 1
+              memory: 48Gi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+          volumeMounts:
+            - name: model-cache
+              mountPath: /models
+              readOnly: true
+            - name: dshm
+              mountPath: /dev/shm
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: model-cache
+          persistentVolumeClaim:
+            claimName: model-cache
+            readOnly: true
+        - name: dshm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 4Gi
+        - name: tmp
+          emptyDir:
+            sizeLimit: 2Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: vllm-judge
+  namespace: mock-interviewer
+  labels:
+    app.kubernetes.io/name: vllm-judge
+    app.kubernetes.io/component: engine
+    app.kubernetes.io/part-of: mock-interviewer
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: vllm-judge
+  ports:
+    - name: http
+      port: 8000
+      targetPort: http
+      protocol: TCP
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: vllm-judge-ingress
+  namespace: mock-interviewer
+  labels:
+    app.kubernetes.io/part-of: mock-interviewer
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: vllm-judge
+  policyTypes:
+    - Ingress
+  ingress:
+    # BOTH the API and the worker, and that is not a hedge — both genuinely make
+    # judge calls on INTERVIEW_LLM_BASE_URL:
+    #   * the API owns the session flow (brain.py's `_judge`, and the scoring
+    #     ledger written for the session report);
+    #   * the worker builds its own judge LLM from `config.llm_base_url` in
+    #     voice/interviewer.py, for the in-call follow-up decision.
+    # A policy that allowed only one of them would break the other in a way that
+    # surfaces as a scoring timeout, not as a network error.
+    #
+    # The API reaches this through base/api/networkpolicy.yaml's engine rule,
+    # which selects `app.kubernetes.io/component: engine` on port 8000 rather
+    # than this Service by name — so adding or renaming an engine here never
+    # requires an edit to the API's policy.
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: api
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: voice-worker
+      ports:
+        - port: 8000
+          protocol: TCP

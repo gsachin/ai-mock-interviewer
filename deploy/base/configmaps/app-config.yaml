@@ -1,0 +1,74 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: app-config
+  namespace: mock-interviewer
+  labels:
+    app.kubernetes.io/part-of: mock-interviewer
+# Shared, non-secret application configuration — the variables in
+# interviewer/config.py that describe how the app behaves, as opposed to which
+# engine it talks to (that is engine-endpoints.yaml).
+#
+# Every value here is identical in the local overlay. That is not a coincidence
+# and it is worth checking when reviewing: if the local overlay ever needs to
+# override a key in THIS file, the base has absorbed an environment-specific
+# decision and the fix belongs here, not in the overlay.
+#
+# All values are quoted strings: a ConfigMap is a map of strings, and an
+# unquoted `5` or `false` is a YAML number/boolean that the API server will
+# reject.
+data:
+  # ── RAG wiring ───────────────────────────────────────────────────────────
+  RAG_MCP_URL: "http://rag:8031/mcp"
+  INTERVIEW_DOMAIN: "system-design"
+  INTERVIEW_TOP_K: "5"
+
+  # ── Sessions ─────────────────────────────────────────────────────────────
+  INTERVIEW_SESSION_STORE: "redis"
+  # Note the instance name: redis-sessions, NOT redis-livekit. The two Redis
+  # instances are separate on purpose (NFR-17) — the session store has no
+  # graceful degradation, so an SFU-side incident or a scale event in LiveKit's
+  # Redis must not be able to take session state down with it.
+  INTERVIEW_REDIS_URL: "redis://redis-sessions:6379"
+
+  # ── Readiness policy ─────────────────────────────────────────────────────
+  # RAG is REPORTED by /readyz but not REQUIRED (US-006 scenario 4). The app is
+  # built to survive a RAG outage: /skills answers 200 with rag_ok=false, the
+  # interview continues on the last-known rubric, and the static UI and
+  # /voice/token have no RAG dependency at all. Setting this true converts a
+  # retrieval degradation into a total outage — including the token endpoint
+  # that starts a session — which is the exact reverse of the designed failure
+  # mode. Flip it only if you positively want readiness to mean "fully healthy".
+  #
+  # Like every other key here, this is inert until US-006 lands: the flag is
+  # read by the /readyz handler, which does not exist yet.
+  INTERVIEW_READY_REQUIRES_RAG: "false"
+
+  # ── Session shape ────────────────────────────────────────────────────────
+  # 3 spoken questions per session; 60 s per answer before one re-prompt and
+  # then the question is scored as unanswered (RCA fix, 2026-09-03).
+  INTERVIEW_MAX_QUESTIONS: "3"
+  INTERVIEW_ANSWER_TIMEOUT_S: "60"
+
+  # ── LiveKit ──────────────────────────────────────────────────────────────
+  LIVEKIT_URL: "http://livekit:7880"
+
+  # ── Runtime ──────────────────────────────────────────────────────────────
+  # Structured logs to stdout, which is the only log sink (BRD-13). Set to
+  # "text" locally for human-readable `kubectl logs` at the cost of losing the
+  # fields the log queries depend on.
+  LOG_FORMAT: "json"
+  # Both paths are baked into the images at exactly these locations (see the
+  # Dockerfile's "reproduce the dev directory layout at /app" block). Setting
+  # them explicitly is defensive: server.py resolves them relative to the
+  # package and fails SILENTLY when it guesses wrong, serving no UI and no
+  # banks with no error anywhere.
+  INTERVIEW_WEB_DIR: "/app/web"
+  INTERVIEW_BANK_DIR: "/app/question_banks"
+  # voice-worker overrides INTERVIEW_BANK_DIR with its own writable cache path
+  # — see voice-worker/deployment.yaml.
+
+  # INTERVIEW_CORS_ORIGINS is deliberately absent: the CORS surface is its own
+  # story (US-007) and today's defaults are the four localhost origins
+  # hardcoded in server.py. Setting it here would freeze a value that story is
+  # about to change.

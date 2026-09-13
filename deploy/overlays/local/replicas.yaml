@@ -1,0 +1,72 @@
+# ── Local replica counts ────────────────────────────────────────────────────
+#
+# The base carries no replica counts where an autoscaler owns them, so the
+# production numbers live in the HPAs (api/rag: min 2) and in the KEDA
+# ScaledObjects (worker: min 1, GPU engines: 1/0). On a two-worker kind cluster
+# those mins add up to more pods than there is anything to prove with, and every
+# extra replica is another model-loading container competing for the same CPU.
+#
+# Two rules applied here:
+#   1. Anything with a floor above 1 drops to 1.
+#   2. The floor must be changed on the CONTROLLER, not just on the Deployment —
+#      an HPA with minReplicas: 2 will put the second replica straight back, so
+#      patching only `spec.replicas` would produce a manifest that says one
+#      thing and a cluster that does another.
+---
+# api: 1. The HPA below is the real control; this is here so that the rendered
+# Deployment is readable without also reading the HPA.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: api
+  namespace: mock-interviewer
+spec:
+  replicas: 1
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: api
+  namespace: mock-interviewer
+spec:
+  minReplicas: 1
+---
+# rag: 1, for the same reason. Note this is a CPU-based HPA, so it will scale
+# out again if the local RAG work is CPU-heavy — that is the autoscaler doing
+# its job, not this overlay being ignored.
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: rag
+  namespace: mock-interviewer
+spec:
+  minReplicas: 1
+---
+# voice-worker: 1, and this one is simply the truth rather than an override:
+# the ScaledObject that would own this count ships with components/gpu-engines,
+# which this overlay does not include (KEDA's CRDs are not installed on kind).
+# So a plain replica count is the whole of the local scaling story, and the
+# cluster will not scale workers at all locally — which is the honest state of
+# things, not a gap in the manifest.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: voice-worker
+  namespace: mock-interviewer
+spec:
+  replicas: 1
+#
+# ── Two consequences of single replicas, stated so they are not mysteries ───
+#
+# 1. The PodDisruptionBudgets stay (`minAvailable: 1` on api and voice-worker).
+#    With one replica that means `kubectl drain` on a worker node BLOCKS: the
+#    PDB can only be satisfied by never evicting the pod, which is exactly what
+#    a PDB is for. It is a local papercut, not a bug — if you need to drain a
+#    node locally, delete that PDB first, and notice that the base comment in
+#    base/voice-worker/pdb.yaml already says the PDB was never what protected a
+#    live interview (preStop + the 900 s grace period is).
+#
+# 2. redis-sessions and redis-livekit are already replicas 1 with `Recreate`
+#    in the base and are not patched here: a single-writer datastore with an
+#    RWO volume cannot have two replicas, locally or anywhere else. Scaling them
+#    is a different problem (a real Redis topology), not a replica count.

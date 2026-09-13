@@ -1,0 +1,260 @@
+# ── vllm-voice — the hot-path LLM (MOD-05) ──────────────────────────────────
+#
+# One of the two vLLM Deployments, and the split is the point: continuous
+# batching ADDS latency under concurrency, which fights the voice budget, while
+# the judge is off the hot path and may batch aggressively or scale to zero
+# (05-modularization.md). Same image, different flags, different floor.
+#
+# GPU-shaped in every dimension: `nvidia.com/gpu: 1` (not compressible, so the
+# request IS the limit), a toleration for the GPU taint (NFR-3 — tolerations go
+# on GPU Deployments ONLY, or CPU pods start landing on GPU nodes), a startup
+# probe measured in minutes rather than seconds, and NO liveness probe.
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: vllm-voice
+  namespace: mock-interviewer
+  labels:
+    app.kubernetes.io/part-of: mock-interviewer
+automountServiceAccountToken: false
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: vllm-voice
+  namespace: mock-interviewer
+  labels:
+    app.kubernetes.io/name: vllm-voice
+    app.kubernetes.io/component: engine
+    app.kubernetes.io/part-of: mock-interviewer
+spec:
+  # No `replicas:` — the KEDA ScaledObject owns the count (NFR-2: exactly one
+  # controller per Deployment; a plain HPA here would be a conflict, not a
+  # backup). Effective count is 1 until KEDA acts, which is exactly
+  # minReplicaCount.
+  revisionHistoryLimit: 3
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      # A GPU pod going away for a moment is a voice turn that misses its
+      # budget, and the replacement costs minutes of model load. Surge first.
+      maxSurge: 1
+      maxUnavailable: 0
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: vllm-voice
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: vllm-voice
+        app.kubernetes.io/component: engine
+        app.kubernetes.io/part-of: mock-interviewer
+      annotations:
+        # vLLM exports Prometheus metrics from the SAME port as the API
+        # (vllm:num_requests_waiting, vllm:gpu_cache_usage_perc, ...), which is
+        # what the ScaledObject's triggers read. Annotations rather than only a
+        # ServiceMonitor: the annotation is the portable default (US-015).
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8000"
+        prometheus.io/path: "/metrics"
+    spec:
+      serviceAccountName: vllm-voice
+      automountServiceAccountToken: false
+      priorityClassName: mock-interviewer-voice-critical
+      # ── The GPU taint (NFR-3) ──────────────────────────────────────────────
+      # The pool is tainted `nvidia.com/gpu=present:NoSchedule`, so a GPU pod
+      # must tolerate it. The converse is the rule that matters: no CPU workload
+      # in this tree tolerates it, because that is how CPU pods end up occupying
+      # the nodes you are paying GPU prices for.
+      #
+      # No nodeSelector. The GPU resource request already restricts scheduling to
+      # nodes with the device plugin's allocatable GPUs, and a made-up pool label
+      # here would be a second, silently wrong source of truth about which nodes
+      # those are.
+      tolerations:
+        - key: nvidia.com/gpu
+          operator: Equal
+          value: present
+          effect: NoSchedule
+      # One voice turn is pinned to one worker, but several interviews share one
+      # GPU: the topologies are independent, so spread the engines rather than
+      # piling two on the same node when a second one exists.
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: vllm-voice
+      securityContext:
+        # Upstream image, root by default: hardened by capability and seccomp
+        # rather than by uid. vLLM needs its CUDA runtime and the device
+        # plugin's mounts; a uid here would be a guess at what the image expects
+        # and the failure mode is a CUDA init error at model load.
+        seccompProfile:
+          type: RuntimeDefault
+      terminationGracePeriodSeconds: 60
+      containers:
+        - name: vllm-voice
+          image: vllm/vllm-openai:latest
+          # `latest` is what the plan's compose sketch uses, and it is recorded
+          # here rather than silently improved: pin this to a release before
+          # production. The image's tag decides the vLLM version, which decides
+          # the exact chat-template behaviour and the metric names the
+          # ScaledObject below depends on.
+          imagePullPolicy: IfNotPresent
+          command: ["/bin/sh", "-c"]
+          args:
+            # The image's entrypoint is this same module; it is re-stated only so
+            # the MODEL can come from engine-endpoints.yaml instead of being a
+            # literal in this file. That matters more than it looks: the app
+            # sends the model name in every request, and vLLM serves it under the
+            # exact `--model` string. A literal here that drifts from the
+            # ConfigMap is a 404 on every turn, discovered by a candidate.
+            #
+            # `exec` so the server replaces the shell and receives SIGTERM
+            # directly — without it, termination waits out the full grace period
+            # while the shell ignores the signal.
+            - |
+              exec python3 -m vllm.entrypoints.openai.api_server \
+                --host 0.0.0.0 \
+                --port 8000 \
+                --model "${INTERVIEW_VOICE_LLM_MODEL}" \
+                --enable-prefix-caching \
+                --gpu-memory-utilization 0.85
+          ports:
+            - name: http
+              containerPort: 8000
+          envFrom:
+            - configMapRef:
+                name: engine-endpoints
+          env:
+            # ── The shared model cache, read-only and offline (DAT-06) ───────
+            # HF_HOME is where the weights are; read-only because the prewarm
+            # Job is the only writer, and offline mode because a download racing
+            # a start-up is exactly the per-replica weights fetch DG-04 removed.
+            # A missing model is then a loud crashloop, not a slow first turn.
+            - name: HF_HOME
+              value: /models
+            - name: HF_HUB_OFFLINE
+              value: "1"
+          # ── STARTUP ONLY. NO LIVENESS PROBE. NO READINESS PROBE. ──────────
+          # This is BRD-02's explicit exemption for GPU workloads, and it is not
+          # laziness:
+          #
+          #   * A liveness probe that fails under GPU pressure restartS the pod,
+          #     which costs a full model load (minutes) and makes the outage
+          #     worse. A busy vLLM is not a broken vLLM.
+          #   * The startup probe is what gates Ready: while it is pending the
+          #     pod is not Ready, and once it passes the server can answer —
+          #     which is precisely the readiness condition. A separate readiness
+          #     probe would re-check the same endpoint with the same answer.
+          #
+          # 120 × 10 s = the 20-minute allowance MOD-13 records, sized for the
+          # worst case on purpose: loading 7B of weights from a network
+          # filesystem (RWX) plus CUDA graph capture. A tighter budget here does
+          # not make the engine start faster, it makes a slow node crashloop.
+          startupProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 10
+            failureThreshold: 120
+          resources:
+            requests:
+              cpu: 2
+              memory: 8Gi
+              # The request IS the limit: GPUs are not compressible and the
+              # device plugin rejects a pod where they differ. One whole GPU,
+              # deliberately — unlike CPU, there is no sensible fraction here.
+              nvidia.com/gpu: 1
+            limits:
+              nvidia.com/gpu: 1
+              memory: 32Gi
+              # No CPU limit, for the same reason as the worker (NFR-5): a CFS
+              # quota on this path shows up as intermittent latency spikes
+              # mid-turn, which reads as a model problem. CPU is the tokenizer
+              # and the request thread; it is not the bottleneck we want to cap.
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+          volumeMounts:
+            - name: model-cache
+              mountPath: /models
+              readOnly: true
+            - name: dshm
+              mountPath: /dev/shm
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: model-cache
+          persistentVolumeClaim:
+            claimName: model-cache
+            readOnly: true
+        # ── /dev/shm, and this one is not optional ─────────────────────────
+        # Containers get 64 MiB of shared memory by default, and vLLM's
+        # multiprocess/tensor-parallel paths use it heavily; too little shows up
+        # as a crash or a stall that looks like a CUDA fault. Memory-backed
+        # emptyDir is the standard fix and it is bounded, so it cannot eat the
+        # node.
+        - name: dshm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 4Gi
+        - name: tmp
+          emptyDir:
+            sizeLimit: 2Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: vllm-voice
+  namespace: mock-interviewer
+  labels:
+    app.kubernetes.io/name: vllm-voice
+    app.kubernetes.io/component: engine
+    app.kubernetes.io/part-of: mock-interviewer
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: vllm-voice
+  ports:
+    - name: http
+      port: 8000
+      targetPort: http
+      protocol: TCP
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: vllm-voice-ingress
+  namespace: mock-interviewer
+  labels:
+    app.kubernetes.io/part-of: mock-interviewer
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: vllm-voice
+  policyTypes:
+    - Ingress
+  ingress:
+    # The WORKER, and only the worker. The voice model is reached through
+    # INTERVIEW_VOICE_LLM_BASE_URL, which only the worker's voice path reads
+    # (voice/interviewer.py builds its voice LLM from it). The API's non-voice
+    # LLM calls go to vllm-judge instead — see engine-endpoints.yaml.
+    #
+    # Operationally: if a debug session cannot reach this pod, remember the
+    # default-deny is not the only rule in play — `kubectl port-forward` is
+    # proxied by the kubelet on the pod's node, so it arrives from the node
+    # address and needs the node CIDR in base/networkpolicy.yaml to be correct.
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: voice-worker
+      ports:
+        - port: 8000
+          protocol: TCP

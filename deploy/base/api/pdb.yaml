@@ -1,0 +1,24 @@
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: api
+  namespace: mock-interviewer
+  labels:
+    app.kubernetes.io/name: api
+    app.kubernetes.io/component: management-api
+    app.kubernetes.io/part-of: mock-interviewer
+spec:
+  # minAvailable: 1 — the API is stateless and one replica can serve, so this is
+  # about never hitting zero during a node drain or a cluster upgrade, not about
+  # protecting a session pinned to a particular pod. That distinction is the
+  # whole reason this file is one line while voice-worker/pdb.yaml carries a
+  # warning: the worker's PDB protects something real, and this one protects
+  # availability.
+  #
+  # A PDB is enforced through the EVICTION API, which means it constrains
+  # `kubectl drain` and node upgrades and does nothing at all about an HPA
+  # scale-down — see voice-worker/pdb.yaml for the long version.
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: api

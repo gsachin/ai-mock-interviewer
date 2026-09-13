@@ -1,0 +1,154 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: rag
+  namespace: mock-interviewer
+  labels:
+    app.kubernetes.io/name: rag
+    app.kubernetes.io/component: rag
+    app.kubernetes.io/part-of: mock-interviewer
+spec:
+  # No `replicas:` — the HPA owns it. Multi-replica is safe only because the
+  # backends are shared services (Qdrant + Elasticsearch) rather than local
+  # state; that is DG-03/US-017, and the local overlay's in-process chroma is
+  # the one configuration with a real single-writer constraint.
+  revisionHistoryLimit: 3
+  progressDeadlineSeconds: 600
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: rag
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: rag
+        app.kubernetes.io/component: rag
+        app.kubernetes.io/part-of: mock-interviewer
+      annotations:
+        # Portable scrape config (BRD-13); the ServiceMonitor is the opt-in
+        # variant for clusters running the Prometheus Operator. The RAG service
+        # is a separate codebase (enterprise-rag-core) and its /metrics story
+        # is not this repo's to promise — the annotation is here so the scrape
+        # side is already correct when it lands.
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8031"
+        prometheus.io/path: "/metrics"
+    spec:
+      serviceAccountName: rag
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: 30
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: rag
+      containers:
+        - name: rag
+          image: mock-interviewer-rag:dev
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8031
+          envFrom:
+            # Both, on purpose: the engine endpoints in the second ConfigMap are
+            # the RAG service's own RAG_CORE_* keys. "Which engine" is one
+            # decision and it is recorded in one place — see the header of
+            # configmaps/engine-endpoints.yaml.
+            - configMapRef:
+                name: app-config
+            - configMapRef:
+                name: engine-endpoints
+          # RAG_CORE_RERANK_MODEL_PATH is not set here: the image bakes the
+          # ~22 MiB ONNX reranker and sets the path in its own ENV (DG-04). The
+          # explicit ENV in the Dockerfile exists because the ERC CLI resolves
+          # the model relative to its repo root — the same silent-failure class
+          # as the web/ path — so it is set once, at build time, where it cannot
+          # be forgotten per environment.
+          # ── Probes ───────────────────────────────────────────────────────
+          # TCP, NOT HTTP, AND THAT IS THE HONEST CHOICE TODAY.
+          #
+          # The RAG service exposes exactly one route: /mcp (streamable HTTP). A
+          # plain GET to it is not a 200 — the transport expects a POST with an
+          # MCP session — so an httpGet probe would fail forever and the pod
+          # would never become Ready, which for a two-replica Deployment with
+          # maxUnavailable: 0 means a rollout that hangs.
+          #
+          # A TCP connect is what can actually be checked right now: the port is
+          # open and something is listening. It does not say the index backends
+          # are reachable — that is the readiness the plan wants ("readiness incl.
+          # index backends", MOD-13), and it arrives with the RAG service's own
+          # /health route (US-017's territory).
+          #
+          # What already covers the consumer side is better than a probe would
+          # be: the API reports RAG in /readyz without requiring it
+          # (INTERVIEW_READY_REQUIRES_RAG=false), so a RAG outage degrades
+          # retrieval instead of taking the UI and the token endpoint down.
+          startupProbe:
+            tcpSocket:
+              port: http
+            periodSeconds: 5
+            failureThreshold: 60 # 5 min: model load + index warm
+          livenessProbe:
+            tcpSocket:
+              port: http
+            periodSeconds: 15
+            timeoutSeconds: 3
+            failureThreshold: 4
+          readinessProbe:
+            tcpSocket:
+              port: http
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+          resources:
+            requests:
+              cpu: 500m
+              memory: 1Gi
+            limits:
+              cpu: "1"
+              # Memory-limited and CPU-limited differently from the worker: this
+              # tier's work is 200-360 ms of uniform CPU (which is why CPU is a
+              # fair HPA signal here), and a throttle degrades a retrieval rather
+              # than cutting a sentence in half. The worker's exemption from CPU
+              # limits (NFR-5) is specific to the realtime audio path.
+              memory: 2Gi
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 10001
+            runAsGroup: 10001
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+            - name: rag-data
+              mountPath: /var/lib/rag
+      volumes:
+        - name: tmp
+          emptyDir:
+            sizeLimit: 512Mi
+        # Writable scratch for an in-process vector store. Unused in this base
+        # (the vector backend is Qdrant), but the local overlay flips the backend
+        # to chroma, which writes to RAG_CORE_CHROMA_PATH — and with
+        # readOnlyRootFilesystem that path has to be a mount. It is an emptyDir
+        # rather than a PVC because the contents are a rebuildable index, not
+        # state; US-017 is where the local overlay gets the PVC it deserves.
+        - name: rag-data
+          emptyDir:
+            sizeLimit: 4Gi

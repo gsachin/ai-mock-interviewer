@@ -1,0 +1,190 @@
+# ── Whisper — STT on GPU (MOD-06) ───────────────────────────────────────────
+#
+# The same OpenAI-compatible transcription API as the local CPU variant, which
+# is the property that makes "develop on CPU, deploy on GPU" a real claim rather
+# than a hope: the app's remote STT adapter (US-011) cannot tell the two apart.
+#
+# The difference from components/cpu-engines/stt.yaml is therefore NOT the
+# interface — it is the device, the weights source and the probe budget:
+#   * reads the shared model cache read-only with HF_HUB_OFFLINE=1, instead of
+#     downloading into an emptyDir on first use;
+#   * asks for a GPU and tolerates the GPU taint;
+#   * has a longer startup allowance, because on a GPU node the container may
+#     start before the device is fully warm.
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: whisper
+  namespace: mock-interviewer
+  labels:
+    app.kubernetes.io/part-of: mock-interviewer
+automountServiceAccountToken: false
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: whisper
+  namespace: mock-interviewer
+  labels:
+    app.kubernetes.io/name: whisper
+    app.kubernetes.io/component: engine
+    app.kubernetes.io/part-of: mock-interviewer
+spec:
+  # No `replicas:` — ScaledObject-owned, floor 1 (NFR-4: a cold GPU node is
+  # minutes of provisioning plus minutes of model load, so the floor is what
+  # keeps the product alive while the pool grows).
+  revisionHistoryLimit: 3
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: whisper
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: whisper
+        app.kubernetes.io/component: engine
+        app.kubernetes.io/part-of: mock-interviewer
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8000"
+        prometheus.io/path: "/metrics"
+    spec:
+      serviceAccountName: whisper
+      automountServiceAccountToken: false
+      priorityClassName: mock-interviewer-voice-critical
+      tolerations:
+        - key: nvidia.com/gpu
+          operator: Equal
+          value: present
+          effect: NoSchedule
+      securityContext:
+        seccompProfile:
+          type: RuntimeDefault
+      terminationGracePeriodSeconds: 60
+      containers:
+        - name: whisper
+          # ── VERIFY THIS TAG BEFORE THE FIRST GPU DEPLOY ────────────────────
+          # The docs name the image (Speaches/Whisper, upstream) and the CPU
+          # variant is pinned in docker-compose.yml; the CUDA variant's tag is
+          # NOT recorded anywhere in this repository. Speaches publishes one tag
+          # per CUDA version because the right one depends on the node's driver,
+          # so this is a value to confirm against the registry — not something to
+          # trust. A wrong tag is ImagePullBackOff on a node you waited minutes
+          # for, and nothing in `kubectl kustomize` will catch it.
+          image: ghcr.io/speaches-ai/speaches:latest-cu124
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8000
+          env:
+            # Same two keys as the CPU variant, and the model comes from the
+            # ConfigMap so the prewarm Job and this server cannot disagree about
+            # which checkpoint must be on the cache.
+            - name: WHISPER__MODEL
+              valueFrom:
+                configMapKeyRef:
+                  name: engine-endpoints
+                  key: INTERVIEW_WHISPER_MODEL
+            - name: WHISPER__DEVICE
+              value: "cuda"
+            # HF_HOME rather than the image's default cache path: the shared
+            # cache is mounted at /models, so this is the one setting that makes
+            # the weights the prewarm Job downloaded the weights this server
+            # reads. Offline mode turns a missing checkpoint into a loud
+            # crashloop instead of a silent per-replica download (DG-04).
+            - name: HF_HOME
+              value: /models
+            - name: HF_HUB_OFFLINE
+              value: "1"
+          # Startup only — BRD-02's GPU exemption. 90 × 10 s = 15 minutes: less
+          # than the LLM engines need (a Whisper checkpoint is far smaller), more
+          # than a CPU start, because the first CUDA context creation on a cold
+          # node is the slow part and restarting it makes it slower.
+          startupProbe:
+            httpGet:
+              path: /v1/models
+              port: http
+            periodSeconds: 10
+            failureThreshold: 90
+          resources:
+            requests:
+              cpu: 1
+              memory: 2Gi
+              nvidia.com/gpu: 1
+            limits:
+              nvidia.com/gpu: 1
+              memory: 8Gi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+          volumeMounts:
+            - name: model-cache
+              mountPath: /models
+              readOnly: true
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: model-cache
+          persistentVolumeClaim:
+            claimName: model-cache
+            readOnly: true
+        - name: tmp
+          emptyDir:
+            sizeLimit: 1Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  # `whisper`, because that is the name base/configmaps/engine-endpoints.yaml
+  # resolves as INTERVIEW_STT_BASE_URL (http://whisper:8000/v1). The CPU variant
+  # is `stt` for the same reason, one overlay down.
+  name: whisper
+  namespace: mock-interviewer
+  labels:
+    app.kubernetes.io/name: whisper
+    app.kubernetes.io/component: engine
+    app.kubernetes.io/part-of: mock-interviewer
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: whisper
+  ports:
+    - name: http
+      port: 8000
+      targetPort: http
+      protocol: TCP
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: whisper-ingress
+  namespace: mock-interviewer
+  labels:
+    app.kubernetes.io/part-of: mock-interviewer
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: whisper
+  policyTypes:
+    - Ingress
+  ingress:
+    # Only the worker transcribes — see the CPU variant for the reasoning. The
+    # interesting note here is the PRIVACY one: extracting STT to its own
+    # service puts candidate audio on the cluster network, where on the CPU path
+    # it never left the worker process (BRD-18). This rule is the compensating
+    # control: exactly one pod in the cluster may send audio here.
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: voice-worker
+      ports:
+        - port: 8000
+          protocol: TCP

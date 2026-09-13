@@ -1,0 +1,65 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+#
+# Base — the portable half of the deployment (BRD-14).
+#
+# Provider-neutral BY CONSTRUCTION. There is no cloud annotation, no
+# StorageClass name, no ingress class, no load-balancer annotation and no GPU
+# taint anywhere below this line. US-019's CI purity check greps this directory
+# for exactly those keys, and "if something lives in an overlay that is not
+# cloud-specific, the base is wrong — fix the base, do not widen the overlay".
+#
+# The AI engines are deliberately NOT here. They live in
+# components/{cpu,gpu}-engines, which is a deviation from the plan's
+# `base/engines/` sketch; the reasoning is in
+# components/gpu-engines/kustomization.yaml and it is the one deviation worth
+# reading before reviewing anything else.
+#
+# Namespace is set explicitly on every namespaced resource rather than with a
+# `namespace:` transformer here: the transformer would also stamp the
+# cluster-scoped PriorityClasses that arrive with the GPU component.
+resources:
+  - namespace.yaml
+  - serviceaccounts.yaml
+  - networkpolicy.yaml
+
+  - configmaps/app-config.yaml
+  - configmaps/engine-endpoints.yaml
+  - configmaps/grafana-dashboard.yaml
+
+  - secrets/livekit-keys.yaml
+  - secrets/rag-token.yaml
+  # secrets/secret.example.yaml is deliberately NOT listed. It documents the
+  # required key shape so a reviewer can see it in a diff (BRD-12), and it must
+  # never be applied — listing it would put a Secret full of placeholders in the
+  # cluster and make "no secret value in the repository" a technicality.
+
+  - api/deployment.yaml
+  - api/service.yaml
+  - api/hpa.yaml
+  - api/pdb.yaml
+  - api/networkpolicy.yaml
+
+  - voice-worker/deployment.yaml
+  - voice-worker/service.yaml
+  - voice-worker/pdb.yaml
+  - voice-worker/networkpolicy.yaml
+
+  - rag/deployment.yaml
+  - rag/service.yaml
+  - rag/hpa.yaml
+  - rag/networkpolicy.yaml
+
+  - livekit/deployment.yaml
+  - livekit/networkpolicy.yaml
+  - livekit/service.yaml
+
+  - data/redis-sessions.yaml
+  - data/redis-livekit.yaml
+
+  - jobs/bootstrap-banks.yaml
+
+  # Prometheus Operator CRs. They need the Operator's CRDs to exist; the local
+  # overlay removes them for that reason. See observability/servicemonitor.yaml.
+  - observability/servicemonitor.yaml
+  - observability/prometheus-rules.yaml

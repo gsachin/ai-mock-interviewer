@@ -1,0 +1,22 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: mock-interviewer
+  labels:
+    app.kubernetes.io/part-of: mock-interviewer
+    # Pod Security Admission.
+    #
+    # enforce=baseline, not restricted. Every workload we build gets the full
+    # restricted profile by hand (runAsNonRoot, 10001, drop ALL, seccomp
+    # RuntimeDefault, read-only rootfs), but the upstream engine images
+    # (redis, ollama, livekit) do not declare a non-root user we can rely on,
+    # and restricted would reject them outright — turning a security setting
+    # into "the local stack will not start".
+    #
+    # The compromise is the standard one: enforce what the platform can always
+    # satisfy, and AUDIT/WARN at restricted so a workload sliding below the
+    # restricted profile shows up in `kubectl get events` and in the API server
+    # audit log rather than silently.
+    pod-security.kubernetes.io/enforce: baseline
+    pod-security.kubernetes.io/audit: restricted
+    pod-security.kubernetes.io/warn: restricted

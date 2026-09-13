@@ -1,0 +1,93 @@
+# ── ServiceMonitors (Prometheus Operator) ───────────────────────────────────
+#
+# ⚠️  THESE REQUIRE THE PROMETHEUS OPERATOR'S CRDs, WHICH ARE NOT INSTALLED
+#     EVERYWHERE — kind being the example that matters here. On a cluster
+#     without them, `kubectl apply` reports "no matches for kind ServiceMonitor"
+#     for these three objects; overlays/local removes them for exactly that
+#     reason.
+#
+# The PORTABLE DEFAULT IS THE POD ANNOTATIONS, NOT THESE — every workload in
+# this tree also carries prometheus.io/scrape|port|path, which works with any
+# Prometheus including the one a platform team already runs (US-015's
+# decision: "annotations are the portable default; the ServiceMonitor is the
+# opt-in overlay for clusters that have it").
+#
+# Shipping both is not redundancy. The annotation answers "scrape this"; the
+# ServiceMonitor answers "scrape this, and here is the relabelling, the interval,
+# and the namespace the Operator should look in" — and only the Operator version
+# can be selected by a Prometheus CR's serviceMonitorSelector, which is how a
+# multi-tenant monitoring stack decides what it is allowed to see.
+#
+# /metrics does not exist yet (US-015). Until it does, these targets 404; the
+# definitions are committed now so the scrape side is already correct and the
+# only remaining change is the route.
+---
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: api
+  namespace: mock-interviewer
+  labels:
+    app.kubernetes.io/name: api
+    app.kubernetes.io/part-of: mock-interviewer
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: api
+  # Explicit rather than defaulted: the ServiceMonitor's own namespaceSelector
+  # decides which namespaces' Services are considered, and stating it means a
+  # Prometheus running in a `monitoring` namespace does not have to be told to
+  # look here.
+  namespaceSelector:
+    matchNames:
+      - mock-interviewer
+  endpoints:
+    - port: http # the named port on the Service, not a number
+      path: /metrics
+      interval: 30s
+      scrapeTimeout: 10s
+---
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: rag
+  namespace: mock-interviewer
+  labels:
+    app.kubernetes.io/name: rag
+    app.kubernetes.io/part-of: mock-interviewer
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: rag
+  namespaceSelector:
+    matchNames:
+      - mock-interviewer
+  endpoints:
+    - port: http
+      path: /metrics
+      interval: 30s
+      scrapeTimeout: 10s
+---
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: voice-worker
+  namespace: mock-interviewer
+  labels:
+    app.kubernetes.io/name: voice-worker
+    app.kubernetes.io/part-of: mock-interviewer
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: voice-worker
+  namespaceSelector:
+    matchNames:
+      - mock-interviewer
+  endpoints:
+    # The control port (US-014), which is where the per-turn latency samples and
+    # the session-state counters are exposed (US-015) — not an application port,
+    # because the worker has none.
+    - port: control
+      path: /metrics
+      interval: 15s
+      scrapeTimeout: 10s

@@ -1,0 +1,110 @@
+# ════════════════════════════════════════════════════════════════════════════
+#  KIND DOES NOT ENFORCE ANY OF THIS.
+#
+#  kind's default CNI (kindnet) contains no policy engine. These objects apply
+#  cleanly, `kubectl get networkpolicy` lists them, and they are SILENTLY INERT.
+#  A green local run is therefore evidence about YAML syntax and nothing at all
+#  about the network posture — do not read it as proof, and do not "verify" a
+#  policy change locally.
+#
+#  Real enforcement needs a policy-capable CNI (Calico; see the commented
+#  install step in start_services.ps1). Two consequences when you install it:
+#    1. the node-CIDR placeholder below must be set to the cluster's node
+#       subnet, or every pod goes NotReady the moment default-deny lands;
+#    2. the egress rules in the per-workload files finally take effect — and
+#       the first thing that will break is DNS if the kube-dns allow is wrong.
+# ════════════════════════════════════════════════════════════════════════════
+
+# ── 1. Default deny, ingress ────────────────────────────────────────────────
+# Everything below is an exception to this. Deploying a new workload without a
+# matching policy is therefore a no-op that looks like a network bug, which is
+# the intended failure direction.
+#
+# Egress is NOT denied namespace-wide, deliberately. The worker's media path
+# (WebRTC to the SFU over 7881/TCP and 7882/UDP) and the engine calls are the
+# kind of thing a blanket egress deny breaks in ways that look like application
+# bugs — so egress is restricted per workload, where the destinations are known,
+# and the worker's rule names the media ports explicitly.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-ingress
+  namespace: mock-interviewer
+  labels:
+    app.kubernetes.io/part-of: mock-interviewer
+spec:
+  podSelector: {}
+  policyTypes:
+    - Ingress
+---
+# ── 2. Kubelet probes ───────────────────────────────────────────────────────
+# Probes originate from the node, not from a pod, so no podSelector can express
+# them. Most CNIs exempt host-originated probe traffic from pod policy
+# enforcement, which is why this looks redundant — but "most" is doing real work
+# in that sentence, and on a CNI that does enforce it, this policy is the
+# difference between a working cluster and every pod flapping NotReady.
+#
+# 192.0.2.0/24 is TEST-NET-1 (RFC 5737): a documentation range that can never
+# match real traffic, so this rule is inert by default rather than accidentally
+# permitting something. Replace it with the target cluster's node CIDR. For the
+# kind cluster that is the docker bridge subnet the nodes sit on (172.18.0.0/16
+# unless kind-config.yaml says otherwise).
+#
+# No `ports:` restriction on purpose: the source is the node itself, which is
+# already inside the trust boundary, and a port list here would have to be
+# updated by every component that adds a port — a rule that silently rots.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-kubelet-probes
+  namespace: mock-interviewer
+  labels:
+    app.kubernetes.io/part-of: mock-interviewer
+spec:
+  podSelector: {}
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - ipBlock:
+            cidr: 192.0.2.0/24
+---
+# ── 3. Prometheus scrape ────────────────────────────────────────────────────
+# Selecting by the conventional namespace label rather than by a bare namespace
+# name: `kubernetes.io/metadata.name` is applied automatically by the API server
+# and cannot drift from the actual namespace. Prometheus conventionally lives in
+# `monitoring`; if yours is elsewhere this is the one line to change.
+#
+# The port list is the union of the metrics endpoints (api, worker control,
+# rag, engines). Scraping is read-only and every one of these endpoints is
+# already reachable by the components that use them, so allowing it widely costs
+# nothing real — an unmonitored tier is the expensive outcome (NFR-12).
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-prometheus-scrape
+  namespace: mock-interviewer
+  labels:
+    app.kubernetes.io/part-of: mock-interviewer
+spec:
+  podSelector: {}
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: monitoring
+      ports:
+        - port: 8010
+          protocol: TCP
+        - port: 8081
+          protocol: TCP
+        - port: 8031
+          protocol: TCP
+        - port: 8000
+          protocol: TCP
+        - port: 8880
+          protocol: TCP
+        - port: 11434
+          protocol: TCP

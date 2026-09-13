@@ -1,0 +1,222 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+#
+# ── Local / kind overlay ────────────────────────────────────────────────────
+#
+#   kubectl kustomize deploy/overlays/local      # render
+#   kubectl apply -k deploy/overlays/local       # deploy (after kind load)
+#
+# This overlay has exactly four jobs, and anything else it started doing would
+# mean the base had stopped being portable (US-019):
+#
+#   1. Swap the GPU engine plane for the CPU one (components/cpu-engines).
+#   2. Point every engine endpoint at those CPU engines — one ConfigMap.
+#   3. Substitute the local LiveKit credentials and the none-auth RAG token.
+#   4. Remove the Prometheus Operator CRs, which kind cannot accept, and pin the
+#      replica counts to something a two-node cluster can actually run.
+#
+# What it deliberately does NOT do: name a StorageClass, add a cloud
+# annotation, change a port, or touch anything about the application itself.
+# The same base plus a different component is the whole difference between this
+# and production.
+#
+# `namespace:` is not set here either — every namespaced resource carries its
+# namespace explicitly, which is what lets the cluster-scoped PriorityClasses in
+# the GPU component survive a build (see base/kustomization.yaml).
+resources:
+  - ../../base
+components:
+  - ../../components/cpu-engines
+#
+# No `images:` block, and that is a decision rather than an omission.
+#
+# kind has no registry here: the three application images are built locally and
+# side-loaded with `kind load docker-image mock-interviewer-api:dev ...`, so
+# they land in each node's image store under exactly the name the base already
+# uses, with `imagePullPolicy: IfNotPresent` meaning "use the loaded one".
+# An `images:` entry that added a registry prefix (localhost:5001/...) would
+# turn a side-loaded image into an ImagePullBackOff, which is the opposite of
+# what this overlay is for. If you later stand up a local registry, this is the
+# place to point at it — one block, no base edit.
+#
+# Third-party engine images (ollama, speaches, kokoro-fastapi-cpu) are pulled
+# from their public registries on first use and cached on the node afterwards.
+#
+# GOTCHA, verified the hard way on this very file: a `---` separator in a
+# kustomization.yaml is not a visual break. kustomize reads only the FIRST YAML
+# document, so a separator silently discards everything after it — generators
+# and patches included — and still exits 0. Sections are marked with comment
+# banners instead.
+#
+# ── Engine endpoints: the CPU plane ─────────────────────────────────────────
+# Merged over base/configmaps/engine-endpoints.yaml, so this is a delta and the
+# base stays readable as the production shape. The keys left untouched are the
+# ones that are the same in both planes (INTERVIEW_KOKORO_VOICE, the RAG
+# Chroma path, and INTERVIEW_STT/TTS_PROVIDER's counterparts).
+generatorOptions:
+  # Without this the generated ConfigMap/Secret would be renamed with a content
+  # hash (`engine-endpoints-7f2b9c4d5`) and every `envFrom` reference — which is
+  # by plain name — would break. The hash is right for immutable config; this
+  # config is meant to be re-applied and rolled out.
+  disableNameSuffixHash: true
+configMapGenerator:
+  - name: engine-endpoints
+    namespace: mock-interviewer
+    behavior: merge
+    literals:
+      # ── LLM: one Ollama process serves both roles ─────────────────────────
+      # The model names are the SAME models as production, named by their
+      # Ollama tags instead of their HF ids (qwen2.5:14b ≈ Qwen2.5-14B-Instruct,
+      # llama3.2:3b ≈ the small hot-path model). Keeping them in step is the
+      # point: a laptop that tests different models is not testing the cluster.
+      #
+      # The judge model is left empty and therefore inherits INTERVIEW_LLM_MODEL
+      # — which is correct here and in production, for the reason recorded in
+      # engine-endpoints.yaml: judge_model can only rename a model on the SAME
+      # base URL.
+      - INTERVIEW_LLM_BASE_URL=http://ollama:11434/v1
+      - INTERVIEW_LLM_MODEL=qwen2.5:14b
+      - INTERVIEW_VOICE_LLM_BASE_URL=http://ollama:11434/v1
+      - INTERVIEW_VOICE_LLM_MODEL=llama3.2:3b
+      # ── STT / TTS providers ───────────────────────────────────────────────
+      # `faster-whisper` and `kokoro`, NOT `whisper-http` / `kokoro-http`, and
+      # this is the one place the local stack is knowingly not the production
+      # stack: the remote adapters are US-011, which has not landed, and the
+      # worker image still carries the in-process models (Dockerfile's worker
+      # target). So the worker transcribes and synthesises in-process while the
+      # `stt` and `tts` Deployments sit next to it, running and Ready, waiting
+      # for that story.
+      #
+      # That is exactly why the base URLs below are still set: when US-011
+      # flips these two values to `whisper-http` / `kokoro-http`, nothing else
+      # in this overlay changes. The engines are already there.
+      - INTERVIEW_STT_PROVIDER=faster-whisper
+      - INTERVIEW_STT_BASE_URL=http://stt:8000/v1
+      - INTERVIEW_TTS_PROVIDER=kokoro
+      - INTERVIEW_TTS_BASE_URL=http://tts:8880/v1
+      # ── RAG: in-process backends, no search tier ──────────────────────────
+      # Chroma on a local volume instead of Qdrant, and the in-RAM BM25 index
+      # instead of Elasticsearch (DG-03/DAT-04/DAT-05). The search tier is not
+      # part of this deliverable, so the alternative to this is a RAG service
+      # that never becomes Ready — and with INTERVIEW_READY_REQUIRES_RAG=false
+      # the UI would still serve while every turn failed to retrieve.
+      #
+      # The base's RAG_CORE_QDRANT_URL / RAG_CORE_ES_URL keys stay in the
+      # ConfigMap, unread: with the backends switched here, neither is
+      # consulted. Removing them would make switching back a two-key edit
+      # instead of one.
+      #
+      # The semantic cache stays OFF (the base's value): pointing it at the
+      # same Redis the session store uses is the coupling NFR-17 exists to
+      # prevent. (docker-compose.yml does exactly that with redisvl, against
+      # the LiveKit instance — worth fixing there separately.)
+      - RAG_CORE_VECTOR_BACKEND=chroma
+      - RAG_CORE_KEYWORD_BACKEND=bm25
+      #
+      # Note on Chroma's data: base/rag/deployment.yaml mounts an emptyDir at
+      # /var/lib/rag, so the vector index does not survive a pod restart. Bank
+      # registration is what fills it, and making that source of truth durable
+      # is US-009/US-010's job — not something to fake with a PVC here.
+#
+# ── Credentials: local values, matching the local SFU ───────────────────────
+# VERIFIED BEHAVIOUR, because it is not what "merge" suggests: a secretGenerator
+# with `behavior: merge` REPLACES the Secret's whole payload. Keys present in
+# the base but absent below do not survive, and the base's `stringData` is
+# dropped in favour of `data`. (configMapGenerator merge IS key-wise — the two
+# generators do not behave alike, and the local build output confirms it.)
+#
+# So each list below must carry EVERY key its consumers read, and it does:
+# three for livekit-keys (both consumers, see below) and one for rag-token.
+secretGenerator:
+  - name: livekit-keys
+    namespace: mock-interviewer
+    behavior: merge
+    literals:
+      # ── devkey / secret, because the local SFU runs `--dev` ───────────────
+      # These are not "secrets that leaked into the repo" — they are the
+      # literal, published credentials LiveKit's dev mode accepts, and they are
+      # here so the SFU and the API agree. One Secret, two consumers: the API
+      # signs a JWT with LIVEKIT_API_KEY/SECRET and the SFU validates it with
+      # the same pair (LIVEKIT_KEYS). A mismatch between those two surfaces in
+      # the browser as an opaque "invalid token", which is why they are edited
+      # together or not at all.
+      #
+      # US-016 replaces this whole story for production: real keys from a real
+      # secret store, TLS, and a multi-node SFU. Nothing about `--dev` is
+      # intended to survive contact with a real cluster.
+      - LIVEKIT_API_KEY=devkey
+      - LIVEKIT_API_SECRET=secret
+      - "LIVEKIT_KEYS=devkey: secret"
+  - name: rag-token
+    namespace: mock-interviewer
+    behavior: merge
+    literals:
+      # Empty, which is the app's explicit none-auth mode for the RAG MCP
+      # client (`rag_mcp_token=env.get("RAG_MCP_TOKEN")`, None/empty = no auth).
+      # Locally the RAG service is only reachable inside the namespace, so an
+      # empty token is the same posture as an unauthenticated local HTTP call —
+      # and a REPLACE_ME placeholder would make every retrieval fail with a 401
+      # that looks like a broken RAG service.
+      - RAG_MCP_TOKEN=
+#
+# ── Patches ────────────────────────────────────────────────────────────────
+patches:
+  - path: replicas.yaml
+
+  # ── Prometheus Operator CRs: removed, not forgotten ───────────────────────
+  # A fresh kind cluster has no Prometheus Operator, so ServiceMonitor and
+  # PrometheusRule are unknown kinds and `kubectl apply` fails with "no matches
+  # for kind". Rendering them is not enough — the rule this tree was built under
+  # is that the local overlay must not contain resources the local cluster
+  # cannot run.
+  #
+  # The cost is stated rather than hidden: on kind there is no ServiceMonitor
+  # for a Prometheus to discover. What still works is the portable half — the
+  # prometheus.io/scrape|port|path ANNOTATIONS on every pod, which is why they
+  # are the default in the base and the Operator CRs are the optional extra
+  # (US-015). Any Prometheus with annotation-based discovery (or a plain scrape
+  # config) finds these pods without the Operator.
+  #
+  # Four separate patches rather than one selector-based delete: an explicit
+  # name per object is unambiguous, and a `target` that accidentally matched
+  # more than intended would silently delete monitoring.
+  - patch: |-
+      $patch: delete
+      apiVersion: monitoring.coreos.com/v1
+      kind: ServiceMonitor
+      metadata:
+        name: api
+        namespace: mock-interviewer
+    target:
+      kind: ServiceMonitor
+      name: api
+  - patch: |-
+      $patch: delete
+      apiVersion: monitoring.coreos.com/v1
+      kind: ServiceMonitor
+      metadata:
+        name: rag
+        namespace: mock-interviewer
+    target:
+      kind: ServiceMonitor
+      name: rag
+  - patch: |-
+      $patch: delete
+      apiVersion: monitoring.coreos.com/v1
+      kind: ServiceMonitor
+      metadata:
+        name: voice-worker
+        namespace: mock-interviewer
+    target:
+      kind: ServiceMonitor
+      name: voice-worker
+  - patch: |-
+      $patch: delete
+      apiVersion: monitoring.coreos.com/v1
+      kind: PrometheusRule
+      metadata:
+        name: mock-interviewer
+        namespace: mock-interviewer
+    target:
+      kind: PrometheusRule
+      name: mock-interviewer

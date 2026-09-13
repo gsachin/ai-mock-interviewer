@@ -1,0 +1,39 @@
+apiVersion: kustomize.config.k8s.io/v1alpha1
+kind: Component
+#
+# CPU engines — the local/kind engine plane.
+#
+# WHY A COMPONENT AND NOT base/engines/ (the plan's sketch):
+#
+#   A strategic-merge patch cannot turn `vllm-voice` into `ollama`. They are
+#   different images with different arguments, different environment, different
+#   readiness semantics and different resource shapes — a patch that "converts"
+#   one into the other is a full replacement wearing a patch's clothes, and it
+#   would have to live in the base, which is exactly what makes a base
+#   non-portable. This is the case components exist for: the resource is
+#   genuinely different per target, and the CHOICE between the two sets is the
+#   target's decision.
+#
+#   So the engines live in components, and each overlay picks one:
+#       overlays/local      → base + cpu-engines   (no GPU, kind)
+#       overlays/production → base + gpu-engines   (the target the plan describes)
+#
+#   A component rather than a second base, because everything else — the API,
+#   the worker, the SFU, the data tier, the policies — is identical between them
+#   and must stay that way. The ONLY thing that differs is which process serves
+#   the model.
+#
+# The two engine components are mutually exclusive in practice, not by
+# construction: nothing stops you applying both, and the result would be two
+# engines per role with only one of them named in engine-endpoints.yaml. If you
+# did that, the unused one would sit there costing resources and answering
+# nothing — which is why the config, not this file, is the thing that decides.
+#
+# These images are the SAME ones docker-compose.yml uses, tags included, so the
+# laptop stack and the cluster run byte-identical engines (Dockerfile comment:
+# "consumed as pinned upstream images — the single biggest scope reduction in
+# the migration").
+resources:
+  - ollama.yaml
+  - stt.yaml
+  - tts.yaml

@@ -1,0 +1,171 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: livekit
+  namespace: mock-interviewer
+  labels:
+    app.kubernetes.io/name: livekit
+    app.kubernetes.io/component: sfu
+    app.kubernetes.io/part-of: mock-interviewer
+spec:
+  # Single replica, and that is the whole point of --dev below.
+  #
+  # ══════════════════════════════════════════════════════════════════════════
+  #  THIS IS THE LOCAL SFU, NOT THE PRODUCTION ONE.
+  #
+  #  --dev is local-only: it generates devkey/secret, skips TLS, and runs
+  #  single-node. US-016 replaces this with the official LiveKit Helm chart, real
+  #  credentials, TLS termination and multi-node + its own Redis — and the reason
+  #  the chart is bought rather than hand-rolled is that RTC port ranges, TURN,
+  #  node-IP advertisement and key format all change between server versions
+  #  (MOD-13's stack-choices table).
+  #
+  #  What this Deployment buys in the meantime: a real SFU the worker can
+  #  register with and the API can mint a valid token against, so the join
+  #  handshake, the grant validation and the drain behaviour are all testable.
+  # ══════════════════════════════════════════════════════════════════════════
+  #
+  # overlays/local sets this Secret's values to devkey/secret, which is what
+  # --dev expects: the API signs a token with those values and this server
+  # validates it with them. If they ever disagree, the browser shows an opaque
+  # "invalid token" while both services look perfectly healthy — see
+  # secrets/livekit-keys.yaml.
+  replicas: 1
+  revisionHistoryLimit: 3
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 0
+      maxUnavailable: 1
+      # 7881/7882 are host-level UDP/TCP ports on whichever node this lands on;
+      # two SFUs during a rollout would contend for them, so the rollout takes
+      # the old one down first. Acceptable because the SFU is single-replica
+      # here: there is no capacity to preserve. US-016's chart is where rolling
+      # the SFU without dropping live rooms becomes a real question.
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: livekit
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: livekit
+        app.kubernetes.io/component: sfu
+        app.kubernetes.io/part-of: mock-interviewer
+      annotations:
+        prometheus.io/scrape: "true"
+        # LiveKit exposes Prometheus metrics on its HTTP port.
+        prometheus.io/port: "7880"
+        prometheus.io/path: "/metrics"
+    spec:
+      serviceAccountName: livekit
+      # Kubernetes injects a <SERVICE>_PORT env var for every Service in the
+      # namespace, so the Service named `livekit` produces
+      # LIVEKIT_PORT=tcp://10.96.x.x:7880 -- which collides with
+      # livekit-server's OWN LIVEKIT_PORT config variable. The server then dies
+      # at startup with:
+      #   could not parse "tcp://10.96.215.153:7880" as uint value ...
+      # Disabling service links is the correct fix rather than renaming the
+      # Service, because the name is part of the stable in-cluster DNS contract.
+      enableServiceLinks: false
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: 60
+      securityContext:
+        # ── Why runAsNonRoot is NOT set here, when it is set on every workload
+        # we build ─────────────────────────────────────────────────────────────
+        # This is an upstream image whose Dockerfile we do not control, and the
+        # rule for runAsNonRoot is unforgiving: if the image's user is root, the
+        # container refuses to start ("runAsNonRoot and image will run as root")
+        # — a local failure with a confusing message, for a hardening property
+        # that we cannot verify here.
+        #
+        # So: the controls that do NOT depend on the image's identity are all
+        # set (no privilege escalation, ALL capabilities dropped, RuntimeDefault
+        # seccomp, read-only root filesystem), and pinning the UID belongs with
+        # US-016, where the image and the chart are chosen deliberately instead
+        # of inherited from the compose stack.
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: livekit
+          image: livekit/livekit-server:v1.9.7
+          imagePullPolicy: IfNotPresent
+          args:
+            - "--dev"
+            - "--bind"
+            - "0.0.0.0"
+          ports:
+            - name: http
+              containerPort: 7880
+            - name: rtc-tcp
+              containerPort: 7881
+            - name: rtc-udp
+              containerPort: 7882
+              protocol: UDP
+          env:
+            # ── The shared key pair ─────────────────────────────────────────
+            # LIVEKIT_KEYS is the server's "key: secret" encoding of the SAME
+            # pair the API signs with (secrets/livekit-keys.yaml holds both
+            # forms in one object precisely so they cannot drift).
+            #
+            # In --dev mode the server ignores this and uses devkey/secret —
+            # which is exactly why the local overlay sets the Secret to those
+            # same values. Wiring it now means that the day --dev is dropped
+            # (US-016) the SFU is already reading real keys, and a mismatch is
+            # impossible by construction rather than by discipline.
+            - name: LIVEKIT_KEYS
+              valueFrom:
+                secretKeyRef:
+                  name: livekit-keys
+                  key: LIVEKIT_KEYS
+          # ── Probes ────────────────────────────────────────────────────────
+          # GET / on the HTTP port. LiveKit answers it as soon as it is
+          # listening, which is the property that matters: a candidate's browser
+          # does the join handshake over 7880, so "listening" is "can serve".
+          startupProbe:
+            httpGet:
+              path: /
+              port: http
+            periodSeconds: 5
+            failureThreshold: 24
+          livenessProbe:
+            httpGet:
+              path: /
+              port: http
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /
+              port: http
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 2
+          resources:
+            # Sized for a single-node dev SFU carrying a handful of sessions.
+            # An SFU's real cost is bandwidth and packet rate, neither of which
+            # this number expresses — US-016 is where the production sizing
+            # question lives.
+            requests:
+              cpu: 250m
+              memory: 256Mi
+            limits:
+              cpu: "1"
+              memory: 512Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        # readOnlyRootFilesystem again, with the same escape hatch: a static
+        # binary that wants to write a temp file gets /tmp and nowhere else. If a
+        # future version needs a config or data directory, it fails loudly
+        # (EROFS at boot) rather than silently.
+        - name: tmp
+          emptyDir:
+            sizeLimit: 256Mi

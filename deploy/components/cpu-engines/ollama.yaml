@@ -1,0 +1,256 @@
+# ── Ollama — the local LLM ──────────────────────────────────────────────────
+#
+# Serves both LLM roles from one process: the voice model on the hot path and
+# the judge model off it (engine-endpoints.yaml selects the names). One process
+# for two models is a CPU-only concession: on GPU they are separate deployments
+# with separate scaling signals.
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: ollama
+  namespace: mock-interviewer
+  labels:
+    app.kubernetes.io/part-of: mock-interviewer
+automountServiceAccountToken: false
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: ollama-models
+  namespace: mock-interviewer
+  labels:
+    app.kubernetes.io/name: ollama
+    app.kubernetes.io/part-of: mock-interviewer
+spec:
+  # No storageClassName: the target's default is used (kind ships
+  # local-path-provisioner as its default, so this binds with no configuration).
+  #
+  # A PVC rather than an emptyDir, and the difference is not academic: the two
+  # models are ~11 GB combined, and an emptyDir would re-download all of it on
+  # every pod restart — turning a container restart into a 20-minute outage that
+  # looks like the engine is broken.
+  #
+  # Note kind's local-path-provisioner does not enforce this number: it is a
+  # directory on the node, and the request is a scheduling intent rather than a
+  # quota.
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 20Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ollama
+  namespace: mock-interviewer
+  labels:
+    app.kubernetes.io/name: ollama
+    # The label the worker's and RAG's egress policies select on. It is what
+    # lets one policy cover this engine set and the GPU set without listing
+    # pod names — see voice-worker/networkpolicy.yaml.
+    app.kubernetes.io/component: engine
+    app.kubernetes.io/part-of: mock-interviewer
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate # one model directory, one writer
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: ollama
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: ollama
+        app.kubernetes.io/component: engine
+        app.kubernetes.io/part-of: mock-interviewer
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "11434"
+        prometheus.io/path: "/metrics"
+    spec:
+      serviceAccountName: ollama
+      automountServiceAccountToken: false
+      # Generous: the first boot downloads ~11 GB, and the pull happens inside
+      # this container (below). Killing it mid-download to satisfy a default
+      # 30 s grace period would be the worst of both worlds.
+      terminationGracePeriodSeconds: 60
+      securityContext:
+        # ── Runs as root, deliberately ──────────────────────────────────────
+        # The image's model directory is root's home (/root/.ollama) and the
+        # volume is provisioned root-owned; forcing a non-root uid here buys a
+        # container that cannot write its own models. The controls that do not
+        # depend on identity are all set (no privilege escalation, ALL caps
+        # dropped, RuntimeDefault seccomp, read-only rootfs).
+        #
+        # To run it non-root properly: set OLLAMA_MODELS to your own path and
+        # add fsGroup — a deliberate change, and one worth making on a shared
+        # cluster rather than on a laptop.
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: ollama
+          image: ollama/ollama:latest
+          imagePullPolicy: IfNotPresent
+          command: ["/bin/sh", "-c"]
+          args:
+            # The same shape as docker-compose.yml's entrypoint, and for the
+            # same reason: ollama's CLI needs the daemon, so the pull has to
+            # happen in this container with the server running alongside it.
+            #
+            # The model NAMES come from engine-endpoints.yaml through envFrom —
+            # so the local overlay's choice of ollama tags is what gets pulled.
+            # Nothing here hardcodes a model, which is what keeps a config
+            # change from silently pulling something the app will never ask for.
+            #
+            # Unlike the compose version there is no bare `|| true`: a failed
+            # pull exits and the pod restarts, retrying the pull (ollama resumes
+            # a partial download). A server that starts happily with no models
+            # is a worse outcome — it fails later, as "model not found" on a
+            # candidate's first question.
+            - |
+              set -e
+              ollama serve &
+              server_pid=$!
+              # Wait for the API rather than sleeping a fixed number of seconds:
+              # a fixed sleep is a race on a loaded machine and a needless delay
+              # on a fast one.
+              for i in $(seq 1 60); do
+                if ollama list >/dev/null 2>&1; then break; fi
+                sleep 2
+              done
+              echo "pulling voice model: ${INTERVIEW_VOICE_LLM_MODEL}"
+              ollama pull "${INTERVIEW_VOICE_LLM_MODEL}"
+              echo "pulling judge/management model: ${INTERVIEW_LLM_MODEL}"
+              ollama pull "${INTERVIEW_LLM_MODEL}"
+              echo "models ready; ollama serving"
+              wait $server_pid
+          ports:
+            - name: http
+              containerPort: 11434
+          envFrom:
+            - configMapRef:
+                name: engine-endpoints
+          env:
+            # Keep the model store on the PVC, not in the image's default home
+            # path, so a container rebuild does not orphan 11 GB of weights.
+            - name: OLLAMA_MODELS
+              value: /models
+          # ── Probes ────────────────────────────────────────────────────────
+          # /api/tags is ollama's own model-list endpoint: it answers 200 only
+          # once the daemon is up, and it is cheap (no inference, no GPU work).
+          # Never probe a generation endpoint from a probe — a probe that queues
+          # behind an inference request measures load, not health, and will fire
+          # exactly when the system is busiest.
+          startupProbe:
+            httpGet:
+              path: /api/tags
+              port: http
+            periodSeconds: 10
+            # 60 min: the first boot on a laptop pulls ~11 GB. Sized for the
+            # worst case on purpose — a startup probe that gives up mid-download
+            # restarts the pull from a partial state.
+            failureThreshold: 360
+          livenessProbe:
+            httpGet:
+              path: /api/tags
+              port: http
+            periodSeconds: 20
+            timeoutSeconds: 5
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /api/tags
+              port: http
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+          resources:
+            requests:
+              cpu: 500m
+              memory: 2Gi
+            limits:
+              # Memory-sized for the 14B model, which must fit in RAM on a CPU
+              # host: below this it swaps and every turn blows the latency
+              # budget in a way that looks like a slow model rather than a
+              # memory problem. Sized for the CPU engine; the GPU component has
+              # its own numbers.
+              memory: 16Gi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+          volumeMounts:
+            - name: models
+              mountPath: /models
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: models
+          persistentVolumeClaim:
+            claimName: ollama-models
+        - name: tmp
+          emptyDir:
+            sizeLimit: 2Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ollama
+  namespace: mock-interviewer
+  labels:
+    app.kubernetes.io/name: ollama
+    app.kubernetes.io/component: engine
+    app.kubernetes.io/part-of: mock-interviewer
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: ollama
+  ports:
+    - name: http
+      port: 11434
+      targetPort: http
+      protocol: TCP
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: ollama-ingress
+  namespace: mock-interviewer
+  labels:
+    app.kubernetes.io/part-of: mock-interviewer
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: ollama
+  policyTypes:
+    - Ingress
+  ingress:
+    # This exists because the namespace default-deny (base/networkpolicy.yaml)
+    # applies to EVERY pod in the namespace, engines included. The egress rules
+    # in voice-worker/, api/ and rag/ are only half of each connection: a packet
+    # needs permission to leave the source and permission to arrive at the
+    # destination, and forgetting the second half denies the traffic just as
+    # completely while making it look like the source is misconfigured.
+    #
+    # Three callers, and all three are real with the local overlay applied:
+    #   voice-worker — the voice LLM and the in-call judge
+    #   api          — question generation and scoring (INTERVIEW_LLM_BASE_URL
+    #                  points here locally, at vllm-judge on GPU)
+    #   rag          — embeddings (RAG_CORE_EMBED_BACKEND=ollama)
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: voice-worker
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: api
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: rag
+      ports:
+        - port: 11434
+          protocol: TCP

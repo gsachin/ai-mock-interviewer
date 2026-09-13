@@ -1,0 +1,75 @@
+# Ingress to the SFU.
+#
+# This file exists because it was MISSING, and the omission was invisible until
+# the cluster was actually exercised: base/networkpolicy.yaml sets a
+# namespace-wide default-deny, and every other workload had a matching
+# *-ingress policy except livekit. The result was a Running, ready SFU that
+# nothing could reach -- the voice worker looped on "failed to connect to
+# livekit" and gave up after 16 attempts, while `kubectl get pods` showed
+# livekit healthy and `netstat` inside the pod showed it listening on :7880.
+#
+# Also worth recording, because both the migration plan and an earlier draft of
+# these manifests asserted the opposite: **kindnet DOES enforce NetworkPolicy**
+# on this kind version (v0.33.0 / k8s v1.37.0). The symptom was a TCP *timeout*
+# to a listening port rather than a refusal, which is the signature of a drop
+# rule. So the network posture here is genuinely testable locally -- and an
+# inert-policy assumption would have hidden a real outage.
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: livekit-ingress
+  namespace: mock-interviewer
+  labels:
+    app.kubernetes.io/part-of: mock-interviewer
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: livekit
+  policyTypes:
+    - Ingress
+  ingress:
+    # The agent worker's control connection. This is the one that was broken:
+    # worker.py connects OUTBOUND to ws://livekit:7880/agent, so livekit must
+    # admit the worker's POD IP, not just the browser's.
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: voice-worker
+      ports:
+        - port: 7880
+          protocol: TCP
+    # The management plane mints room JWTs and manages rooms over LiveKit's
+    # server API (and would need it again for the scaler's room snapshot).
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: api
+      ports:
+        - port: 7880
+          protocol: TCP
+    # The browser. WebRTC signalling is a WebSocket upgrade from the candidate's
+    # page through the ingress controller, so the ingress namespace must be
+    # admitted on 7880 as well as the media ports.
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: ingress-nginx
+      ports:
+        - port: 7880
+          protocol: TCP
+        - port: 7881
+          protocol: TCP
+        - port: 7882
+          protocol: UDP
+    # Kubelet probes are a node-sourced request and are not matched by
+    # podSelector rules, so without this the probes time out and the pod never
+    # goes Ready even though the server is fine.
+    - from:
+        - ipBlock:
+            # RFC 5737 documentation range -- REPLACE with the node/pod CIDR on
+            # any enforcing CNI. See base/networkpolicy.yaml for the same note.
+            cidr: 192.0.2.0/24
+      ports:
+        - port: 7880
+          protocol: TCP

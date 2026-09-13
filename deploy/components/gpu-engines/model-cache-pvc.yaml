@@ -1,0 +1,48 @@
+# ── The shared model cache (DAT-06 / DG-04 / NFR-10) ────────────────────────
+#
+# One volume, four engine Deployments, read-mostly, written once by the prewarm
+# Job. "Tens of GB, written once per model" is the access pattern, and it is the
+# only reason a shared filesystem is acceptable here.
+#
+# ReadWriteMany is the requirement the engines impose: vllm-voice and
+# vllm-judge are separate Deployments (and Whisper and Kokoro are two more),
+# so the same weights must be readable from pods on different nodes at the same
+# time (DG-04: weights must not be downloaded per replica).
+#
+# ── READ THIS BEFORE APPLYING ────────────────────────────────────────────────
+# RWX is not free and it is not universal. Most default StorageClasses are
+# ReadWriteOnce-only (including kind's local-path provisioner and the default
+# class on several managed clusters), so this PVC will sit Pending forever and
+# the engines will stay unschedulable — with no error that names the cause.
+#
+# That makes the StorageClass for this PVC one of the four things US-019 says
+# belongs in a provider overlay:
+#     local      → RWO + a single node, or skip this component entirely
+#     cloud      → efs-sc / filestore / azurefile / a CSI RWX class
+#     on-prem    → the NFS or CephFS class that already exists
+# The base names no class (BRD-14: cloud specifics stay out of the base), so
+# this will bind only where the target's DEFAULT class supports RWX, or where an
+# overlay sets `storageClassName` explicitly. If that is not your cluster, the
+# fix is an overlay patch on this PVC — not a base edit.
+#
+# The alternative the plan considered and rejected for DAT-03 was object
+# storage. It is the right answer for question banks (small, mutable, versioned)
+# and the wrong one here: vLLM needs the weights as local files it can mmap.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: model-cache
+  namespace: mock-interviewer
+  labels:
+    app.kubernetes.io/name: model-cache
+    app.kubernetes.io/part-of: mock-interviewer
+spec:
+  accessModes:
+    - ReadWriteMany
+  resources:
+    requests:
+      # Sum of the four models with headroom, and it is a real number rather than
+      # a round one: ~15 GB for the 14B judge, ~6 GB for the 7B-AWQ voice model,
+      # ~1 GB of Whisper checkpoints across sizes, ~1 GB for Kokoro-82M and its
+      # tokenizer, plus blobs the downloader keeps for resumability.
+      storage: 40Gi

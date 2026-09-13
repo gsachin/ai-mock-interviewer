@@ -146,7 +146,7 @@ RUN apt-get update \
 COPY enterprise-rag-core/ /rag/
 WORKDIR /rag
 
-RUN python -m pip install -e ".[mcp]"
+RUN python -m pip install -e ".[mcp,chroma,qdrant,elasticsearch,redisvl]"
 
 # The ONNX reranker is ~22 MiB — small and immutable, so it is baked rather
 # than PVC-backed (DG-04). Set explicitly because the ERC CLI resolves it

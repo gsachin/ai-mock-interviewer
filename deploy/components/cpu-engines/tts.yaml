@@ -1,0 +1,150 @@
+# ── Kokoro (TTS) — CPU ──────────────────────────────────────────────────────
+#
+# Voice quality is a hard product requirement ("the interviewer must sound like
+# a natural human"; robotic voices are excluded), which is why this is Kokoro
+# and not espeak/piper. It is also the engine with the highest call rate in the
+# system — one synthesis per sentence, several per turn — so it is measured
+# first when a voice turn misses its budget.
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: tts
+  namespace: mock-interviewer
+  labels:
+    app.kubernetes.io/part-of: mock-interviewer
+automountServiceAccountToken: false
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: tts
+  namespace: mock-interviewer
+  labels:
+    app.kubernetes.io/name: tts
+    app.kubernetes.io/component: engine
+    app.kubernetes.io/part-of: mock-interviewer
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: tts
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: tts
+        app.kubernetes.io/component: engine
+        app.kubernetes.io/part-of: mock-interviewer
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8880"
+        prometheus.io/path: "/metrics"
+    spec:
+      serviceAccountName: tts
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: 60
+      securityContext:
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: tts
+          image: ghcr.io/remsky/kokoro-fastapi-cpu:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8880
+          env:
+            # The voice preset. af_heart is the high-quality natural preset the
+            # config defaults to; it is set here as well as in engine-endpoints
+            # because this engine also serves direct callers (the OpenAI-
+            # compatible /v1/audio/speech), and a default that differs between
+            # the server and the client is a voice that changes when someone
+            # restarts one of them.
+            - name: KOKORO_VOICE
+              value: "af_heart"
+          # ── Probes ────────────────────────────────────────────────────────
+          # /health here, because unlike Speaches this image documents one
+          # (docker-compose.yml polls exactly this path).
+          startupProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 10
+            failureThreshold: 60 # 10 min: first boot loads the ONNX voices
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 20
+            timeoutSeconds: 5
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+          resources:
+            requests:
+              cpu: 500m
+              memory: 1Gi
+            limits:
+              # onnxruntime on a CPU node is the memory-heavy part here; the
+              # synthetic voice is what the candidate hears, so a synthesis that
+              # fails for memory is a failed interview, not a degraded one.
+              memory: 4Gi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir:
+            sizeLimit: 1Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: tts
+  namespace: mock-interviewer
+  labels:
+    app.kubernetes.io/name: tts
+    app.kubernetes.io/component: engine
+    app.kubernetes.io/part-of: mock-interviewer
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: tts
+  ports:
+    - name: http
+      port: 8880
+      targetPort: http
+      protocol: TCP
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: tts-ingress
+  namespace: mock-interviewer
+  labels:
+    app.kubernetes.io/part-of: mock-interviewer
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: tts
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: voice-worker
+      ports:
+        - port: 8880
+          protocol: TCP

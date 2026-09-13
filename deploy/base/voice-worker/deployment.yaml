@@ -1,0 +1,226 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: voice-worker
+  namespace: mock-interviewer
+  labels:
+    app.kubernetes.io/name: voice-worker
+    app.kubernetes.io/component: voice-worker
+    app.kubernetes.io/part-of: mock-interviewer
+spec:
+  # No `replicas:` and no HPA.
+  #
+  # The worker's correct signal is interviews in flight, not CPU (BRD-07), so
+  # the autoscaler is a KEDA ScaledObject — which is a CRD and therefore cannot
+  # live in the base: base has to apply to a cluster that has never heard of
+  # KEDA (kind, and any cluster where the KEDA dependency is still an open
+  # feasibility question, MOD-13 open item 1). The ScaledObject ships with
+  # components/gpu-engines/keda-scaledobjects.yaml, which is the component that
+  # already requires installed CRDs.
+  #
+  # With no `replicas` the effective count is 1, which is the floor and the
+  # whole of it. overlays/local sets 1 explicitly.
+  #
+  # NFR-2: never both. A second plain HPA on this Deployment would fight the
+  # ScaledObject for spec.replicas and produce scale events nobody can explain.
+  revisionHistoryLimit: 3
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      # maxUnavailable: 0 is the point of this whole file, together with the
+      # grace period below: a rolling update must never take the last serving
+      # worker out from under a live interview. maxSurge: 1 costs one extra pod
+      # during the rollout, which is the cheapest possible price for that.
+      maxSurge: 1
+      maxUnavailable: 0
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: voice-worker
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: voice-worker
+        app.kubernetes.io/component: voice-worker
+        app.kubernetes.io/part-of: mock-interviewer
+      annotations:
+        prometheus.io/scrape: "true"
+        # The CONTROL port (US-014), not an application port: the worker
+        # registers outbound with the SFU and receives jobs over that
+        # connection, so there is nothing to scrape on the media path.
+        prometheus.io/port: "8081"
+        prometheus.io/path: "/metrics"
+    spec:
+      serviceAccountName: voice-worker
+      automountServiceAccountToken: false
+      # ── 900 s: the longest an interview can run, and the reason this number
+      # is here ─────────────────────────────────────────────────────────────
+      # A LiveKit interview is pinned to one worker process for its lifetime, so
+      # terminating that process does not degrade service — it destroys a live
+      # candidate session mid-sentence. 900 s matches the product's worst-case
+      # interview (NFR-6) and is the actual protection here; the PDB next door
+      # covers node drains only (see pdb.yaml).
+      #
+      # The cost is real and accepted: a worker with nothing to do still takes
+      # up to the grace period to go away unless preStop is implemented, which
+      # is why US-014's AC-3 ("a worker with zero active jobs exits in under two
+      # seconds") is not an optimisation — it is what keeps scale-down from
+      # being slow for no reason.
+      terminationGracePeriodSeconds: 900
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: voice-worker
+      containers:
+        - name: voice-worker
+          image: mock-interviewer-worker:dev
+          imagePullPolicy: IfNotPresent
+          # No inbound application traffic: the worker dials the SFU. The
+          # control port is health/readiness/metrics only (US-014/US-015) and
+          # the Service in service.yaml exports it under a stable name.
+          ports:
+            - name: control
+              containerPort: 8081
+          envFrom:
+            - configMapRef:
+                name: app-config
+            - configMapRef:
+                name: engine-endpoints
+          env:
+            # ── Why this differs from the API ──────────────────────────────
+            # The API reads /app/question_banks straight from the image: it only
+            # ever reads, and a read-only root filesystem is fine for that.
+            #
+            # The worker writes: it keeps a bank cache it refreshes as banks
+            # change (US-009/US-010 move the source of truth to the object store
+            # and make this path a real cache rather than a fallback). With
+            # readOnlyRootFilesystem: true the write would fail with an EROFS
+            # nobody expects, so the cache is pointed at a writable emptyDir.
+            #
+            # An empty directory is a valid state, not a broken one: 0 banks
+            # reports as ok (US-006 scenario 9), and the question content the
+            # interview actually asks arrives through RAG at rag:8031/mcp. This
+            # is a cache, and it is honest about being one.
+            - name: INTERVIEW_BANK_DIR
+              value: /var/cache/banks
+            - name: LIVEKIT_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: livekit-keys
+                  key: LIVEKIT_API_KEY
+            - name: LIVEKIT_API_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: livekit-keys
+                  key: LIVEKIT_API_SECRET
+            - name: RAG_MCP_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: rag-token
+                  key: RAG_MCP_TOKEN
+          # ── preStop: a placeholder that SUCCEEDS ────────────────────────
+          # US-014 replaces this with a call to POST /drain on the control port:
+          #     exec: {command: ["curl", "-fsS", "-XPOST", "http://127.0.0.1:8081/drain"]}
+          # (curl is in the worker image — see the Dockerfile's base stage.)
+          #
+          # Until then this is a no-op, and it is a no-op ON PURPOSE rather than
+          # a `sleep 60`: a sleep would look like a drain in a log review, and
+          # the first reviewer to see it would reasonably conclude the drain was
+          # handled. `true` is honest about there being nothing here yet.
+          # Note the hook must be idempotent (US-014 AC-3): the kubelet runs it
+          # again on container restart, and once the real drain lands a second
+          # call must be a no-op rather than an error.
+          lifecycle:
+            preStop:
+              exec:
+                command: ["true"]
+          # ── Probes ──────────────────────────────────────────────────────
+          # LIVENESS is process liveness, and that is the correct contract for
+          # liveness: the container is doing its job if the process is alive.
+          startupProbe:
+            exec:
+              command: ["pgrep", "-f", "interviewer.voice.worker"]
+            periodSeconds: 10
+            failureThreshold: 30 # 5 min: model load + SFU registration
+          livenessProbe:
+            exec:
+              command: ["pgrep", "-f", "interviewer.voice.worker"]
+            periodSeconds: 15
+            timeoutSeconds: 5
+            failureThreshold: 3
+          #
+          # READINESS IS DELIBERATELY ABSENT, NOT FORGOTTEN.
+          #
+          # The real readiness contract is "registered with the SFU, in the
+          # serving state" — GET /readyz on control port 8081, 503 while
+          # registering, 503 while draining, 200 only when serving (US-014
+          # AC-4). That server does not exist yet; US-014 adds it.
+          #
+          # A placeholder readiness probe would be worse than none: `pgrep`
+          # would report the pod Ready while it is still registering, so the
+          # scaler and the SFU would select a worker that cannot take a job —
+          # exactly the failure US-014 AC-4 exists to make visible ("a worker
+          # that never registered" is a use case of its own, UC-10). With no
+          # readiness probe the pod is Ready when it starts, and that is the
+          # honest description of what can be checked today.
+          #
+          # When US-014 lands:
+          #   readinessProbe:
+          #     httpGet: {path: /readyz, port: control}
+          #     periodSeconds: 5
+          #     timeoutSeconds: 2
+          #     failureThreshold: 2
+          resources:
+            requests:
+              cpu: 500m
+              memory: 1Gi
+            limits:
+              # ── NO CPU LIMIT. THIS IS NOT AN OVERSIGHT. ─────────────────
+              # A CPU limit puts the container in a CFS quota; once it is hit,
+              # the kernel throttles it in 100 ms slices. On a realtime audio
+              # path that is not "slower" — it is a burst of latency at exactly
+              # the wrong moment (mid-turn), it is intermittent, and it looks
+              # like an engine problem. Requests reserve the capacity the worker
+              # needs; a limit would only decide when to hurt it (NFR-5).
+              #
+              # Memory is limited because memory is compressible in the sense
+              # that matters: exceeding it is a clean OOM kill, not a latency
+              # cliff, and an unbounded worker would take the node with it.
+              memory: 1Gi
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 10001
+            runAsGroup: 10001
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+            - name: bank-cache
+              mountPath: /var/cache/banks
+      volumes:
+        # ffmpeg and pydub (MP3 decode of hosted TTS, resampling buffers) write
+        # to /tmp, and the root filesystem is read-only.
+        - name: tmp
+          emptyDir:
+            sizeLimit: 1Gi
+        - name: bank-cache
+          emptyDir:
+            # Not "one more cache": with readOnlyRootFilesystem the worker has
+            # nowhere else to write the bank cache, and INTERVIEW_BANK_DIR points
+            # here. emptyDir rather than a PVC because a cache that disappears on
+            # restart is a cache; the source of truth is the object store
+            # (US-010) with the image's copy as the cold-start fallback.
+            sizeLimit: 512Mi

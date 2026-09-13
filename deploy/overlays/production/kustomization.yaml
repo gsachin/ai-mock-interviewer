@@ -1,0 +1,77 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+#
+# ── Production overlay — THIN ON PURPOSE ────────────────────────────────────
+#
+# Four lines of substance. That is the goal, not an unfinished file: NFR-1 says
+# a fat overlay is the symptom of an unpurified base, and the purity check in
+# US-019 exists to keep it this shape.
+#
+# What this overlay is: the base — which is already production-shaped — plus the
+# GPU engine plane. Nothing else differs between a laptop and a cluster except
+# which process serves the model.
+#
+# ── WHAT THIS FILE DOES NOT CONTAIN, AND WHY ────────────────────────────────
+# US-019 defines exactly four keys as legitimately cloud-specific, and ALL FOUR
+# are absent here on purpose — they belong in a PROVIDER overlay
+# (overlays/eks, overlays/gke, overlays/on-prem, ...), not in a file that claims
+# to be portable production:
+#
+#   1. StorageClass — `model-cache` asks for ReadWriteMany and names no class.
+#      It binds only where the DEFAULT class supports RWX, which is not most
+#      clusters. A provider overlay sets `storageClassName` on that PVC (and
+#      only that PVC — see components/gpu-engines/model-cache-pvc.yaml).
+#   2. Ingress class + the LiveKit media path — base ships no Ingress at all.
+#      The API is reachable in-cluster (Service `api`), and the SFU needs more
+#      than an Ingress: NFR-9's proxy-buffering off and 3600 s timeouts.
+#   3. LoadBalancer annotations — the SFU's media Service must become
+#      type LoadBalancer in a provider overlay (UDP on 7882 does not survive a
+#      ClusterIP). base/livekit/service.yaml says so where it matters.
+#   4. ClusterSecretStore — secret delivery. The base ships plain Secrets with
+#      REPLACE_ME placeholders (BRD-12); External Secrets is the cloud answer
+#      and is not part of this deliverable.
+#
+# Still missing for a REAL production deployment, listed so that a green
+# `kubectl apply` is not mistaken for readiness:
+#   * The search tier — Qdrant + Elasticsearch (DG-03/US-017). engine-endpoints
+#     names them, nothing creates them, and the RAG tier will not become Ready
+#     until they exist. This is the largest gap in this deliverable.
+#   * LiveKit production — real credentials, TLS, multi-node, its own Redis
+#     (US-016). Today the base runs the same `--dev` single-node SFU as the
+#     laptop, which is explicitly not a production configuration.
+#   * The embedding backend decision (MOD-05, open): the base sets
+#     RAG_CORE_EMBED_BACKEND=ollama and `ollama` is a CPU-component service, so
+#     a GPU-only cluster has no working embed path. See
+#     components/gpu-engines/kustomization.yaml for the three options.
+#   * Node pools: a tainted GPU pool, a Cluster Autoscaler, the NVIDIA device
+#     plugin, and the KEDA operator. None of those are created here.
+resources:
+  - ../../base
+components:
+  - ../../components/gpu-engines
+#
+# `environment: production` on every object, for one practical reason: it makes
+# "which overlay is this cluster running?" answerable from `kubectl get deploy
+# -o jsonpath`, and it lets a provider overlay add its own label without
+# fighting this one.
+#
+# includeSelectors: false, and that is load-bearing rather than tidy.
+# `spec.selector` on a Deployment is IMMUTABLE: a label transformer that
+# included selectors would make every subsequent apply fail with a field-is-
+# immutable error on any cluster that already has these Deployments — and it
+# would silently change which pods the NetworkPolicies and PDBs select. Tying
+# the environment label to pod/Service selectors buys nothing here.
+labels:
+  - includeSelectors: false
+    pairs:
+      environment: production
+#
+# ── If your cluster has no Prometheus Operator ──────────────────────────────
+# The base ships three ServiceMonitors and one PrometheusRule, because a
+# production cluster usually has the Operator. On one that does not, `apply`
+# fails with "no matches for kind ServiceMonitor" — the same failure
+# overlays/local deletes them to avoid, and the same four `$patch: delete`
+# entries work here. The portable half of the observability story is unaffected:
+# every pod carries prometheus.io/scrape|port|path annotations (US-015), so a
+# Prometheus with annotation-based discovery scrapes this stack with no
+# Operator at all.

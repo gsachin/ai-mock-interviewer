@@ -1,0 +1,79 @@
+# ── Alerts ──────────────────────────────────────────────────────────────────
+#
+# Same CRD caveat as servicemonitor.yaml: this needs the Prometheus Operator.
+# On a plain-Prometheus cluster the rules below go in that Prometheus's own rule
+# files — the expressions are what matters, not the wrapper.
+#
+# WHAT IS HONEST ABOUT THIS FILE: only the first alert is fully wired to
+# something that exists today. `up` is synthesised by Prometheus for every
+# scrape target, so MockInterviewerTargetDown works the day a scrape config
+# exists and needs nothing from this codebase.
+#
+# The second rule depends on the metric names US-015 introduces, and those names
+# are that story's to fix. It is written with the intended shape (a turn-latency
+# histogram against the 1500 ms budget) and marked as needing reconciliation,
+# because an alert with a guessed metric name is worse than no alert — it looks
+# like coverage.
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: mock-interviewer
+  namespace: mock-interviewer
+  labels:
+    app.kubernetes.io/part-of: mock-interviewer
+spec:
+  groups:
+    - name: mock-interviewer.availability
+      rules:
+        - alert: MockInterviewerTargetDown
+          # Fires when a scrape target for this namespace has been unreachable
+          # for 5 minutes. The `job` label is the Prometheus job name, so the
+          # regex is deliberately loose: this must keep working when the scrape
+          # job is renamed from the Operator's generated name to a hand-written
+          # one, which is the migration that actually happens in practice.
+          expr: |
+            up{job=~".*mock-interviewer.*"} == 0
+          for: 5m
+          labels:
+            severity: critical
+            component: platform
+          annotations:
+            summary: "A mock-interviewer target has been unreachable for 5m"
+            description: >-
+              {{ $labels.job }} / {{ $labels.instance }} has failed to scrape for
+              5 minutes. Check the pod's readiness and its last logs before
+              assuming a monitoring problem — in this stack the usual cause is a
+              dependency the app cannot reach, not the exporter.
+
+    - name: mock-interviewer.voice-budget
+      rules:
+        # ── RECORDING RULE: the voice turn budget ───────────────────────────
+        # US-015 defines the 1500 ms budget and the per-hop histogram. The
+        # expression below is the shape that story fixes; the metric name MUST
+        # be reconciled with interviewer/metrics.py before this is trusted, and
+        # until then it evaluates to an empty vector (no data, no alert, no
+        # false confidence).
+        - record: mock_interviewer:voice_turn_latency:p95_5m
+          expr: |
+            histogram_quantile(
+              0.95,
+              sum by (le) (rate(interviewer_voice_hop_seconds_bucket[5m]))
+            )
+        - alert: MockInterviewerVoiceTurnBudgetBurn
+          # Only fires once the recording rule produces samples. The `for: 15m`
+          # is not padding: a single slow turn is noise, and a budget alert that
+          # pages on one slow turn gets muted within a week — which is worse than
+          # not having it.
+          expr: mock_interviewer:voice_turn_latency:p95_5m > 1.5
+          for: 15m
+          labels:
+            severity: warning
+            component: voice
+          annotations:
+            summary: "Voice turn p95 has exceeded the 1500 ms budget for 15m"
+            description: >-
+              p95 voice-turn latency is {{ $value | humanizeDuration }} against a
+              1.5s budget. The per-hop histogram is what makes this attributable:
+              check which hop (stt, rag, voice LLM, tts) moved before touching
+              anything. A CPU-throttled worker is a common cause and is invisible
+              in application logs.

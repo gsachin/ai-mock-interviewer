@@ -1,0 +1,147 @@
+# ── LiveKit's Redis — the SECOND instance ───────────────────────────────────
+#
+# Not a copy of redis-sessions.yaml with a different name. The two instances
+# exist because they fail differently and must not fail together (NFR-17):
+#   * redis-sessions holds candidate progress the product cannot rebuild;
+#   * redis-livekit holds SFU coordination state (room membership, node
+#     assignment) that is rebuilt as nodes re-register.
+# Merging them would mean an SFU incident takes session state down with it, and
+# a session-store FLUSH could evict room state — the two outages the split
+# exists to prevent.
+#
+# Who uses it: the MULTI-NODE SFU. The single-node `--dev` server in
+# base/livekit does not need Redis at all, so on this base alone this Deployment
+# is unclaimed — deliberately. It ships now because the split is a day-one
+# decision, not a migration: the instance name is already in the NetworkPolicy
+# story, and US-016's chart points at redis-livekit:6379 without anything else
+# having to move.
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: redis-livekit
+  namespace: mock-interviewer
+  labels:
+    app.kubernetes.io/name: redis-livekit
+    app.kubernetes.io/component: cache
+    app.kubernetes.io/part-of: mock-interviewer
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: redis-livekit
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: redis-livekit
+        app.kubernetes.io/component: cache
+        app.kubernetes.io/part-of: mock-interviewer
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "6379"
+        prometheus.io/path: "/metrics"
+    spec:
+      serviceAccountName: redis-livekit
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: 30
+      securityContext:
+        seccompProfile:
+          type: RuntimeDefault
+        # NOT cosmetic. The official redis entrypoint chowns its data dir when
+        # it starts as root, but `capabilities.drop: [ALL]` further down removes
+        # CAP_CHOWN -- so that chown fails with "Operation not permitted" and
+        # the container crash-loops before redis ever starts. Running as the
+        # image's own redis uid (999) makes the entrypoint skip the chown
+        # branch entirely, and fsGroup makes the emptyDir writable for it.
+        # (Learned by deploying, not by reading: the manifest was valid and
+        # applied cleanly.)
+        runAsUser: 999
+        runAsGroup: 999
+        fsGroup: 999
+      containers:
+        - name: redis
+          image: redis:7.4-alpine
+          imagePullPolicy: IfNotPresent
+          args:
+            # No persistence, unlike the session store, and the contrast is the
+            # point: this state is rebuildable, so paying for AOF here would buy
+            # nothing but a slower restart. (docker-compose.yml makes the same
+            # choice for its single instance.)
+            - "redis-server"
+            - "--save"
+            - ""
+            - "--appendonly"
+            - "no"
+            - "--maxmemory"
+            - "256mb"
+            - "--maxmemory-policy"
+            - "allkeys-lru"
+          ports:
+            - name: redis
+              containerPort: 6379
+          startupProbe:
+            exec:
+              command: ["redis-cli", "ping"]
+            periodSeconds: 5
+            failureThreshold: 12
+          livenessProbe:
+            exec:
+              command: ["redis-cli", "ping"]
+            periodSeconds: 15
+            timeoutSeconds: 3
+            failureThreshold: 3
+          readinessProbe:
+            exec:
+              command: ["redis-cli", "ping"]
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 2
+          resources:
+            requests:
+              cpu: 50m
+              memory: 128Mi
+            limits:
+              cpu: 250m
+              memory: 384Mi # above maxmemory, same reasoning as redis-sessions
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+          volumeMounts:
+            - name: data
+              mountPath: /data
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        # emptyDir, not a PVC: nothing here is worth persisting. This is the
+        # visible expression of "rebuildable state" and it is what makes the
+        # contrast with redis-sessions.yaml reviewable at a glance.
+        - name: data
+          emptyDir:
+            sizeLimit: 256Mi
+        - name: tmp
+          emptyDir:
+            sizeLimit: 64Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: redis-livekit
+  namespace: mock-interviewer
+  labels:
+    app.kubernetes.io/name: redis-livekit
+    app.kubernetes.io/component: cache
+    app.kubernetes.io/part-of: mock-interviewer
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: redis-livekit
+  ports:
+    - name: redis
+      port: 6379
+      targetPort: redis
+      protocol: TCP

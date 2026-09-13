@@ -1,0 +1,34 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: voice-worker
+  namespace: mock-interviewer
+  labels:
+    app.kubernetes.io/name: voice-worker
+    app.kubernetes.io/component: voice-worker
+    app.kubernetes.io/part-of: mock-interviewer
+spec:
+  # This Service carries NO application traffic, and saying so is the point.
+  #
+  # The worker dials OUT to the SFU and receives job dispatch over that
+  # connection — the SFU never dials in. That is precisely why the tier scales on
+  # queue depth rather than on HTTP request rate (BRD-07): there is no inbound
+  # request rate to scale on.
+  #
+  # The port exported here is the control plane: health, readiness, metrics
+  # (US-014), and the /drain endpoint that preStop calls. It exists as a Service
+  # so that a scrape target and a future drain caller have a stable name to use,
+  # rather than so anything can be routed to it. networkpolicy.yaml keeps it to
+  # the kubelet and Prometheus.
+  #
+  # ClusterIP with no selector tricks: the selector is the same label the
+  # Deployment stamps on its pods, and a Service with no matching pods (e.g.
+  # scaled to zero between interviews) is simply empty, which is correct.
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: voice-worker
+  ports:
+    - name: control
+      port: 8081
+      targetPort: control
+      protocol: TCP

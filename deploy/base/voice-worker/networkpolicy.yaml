@@ -1,0 +1,116 @@
+# kindnet does not enforce NetworkPolicy — see the warning in
+# base/networkpolicy.yaml. These rules are syntax-checked locally and nothing
+# more.
+---
+# ── Ingress: control plane only ─────────────────────────────────────────────
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: voice-worker-ingress
+  namespace: mock-interviewer
+  labels:
+    app.kubernetes.io/part-of: mock-interviewer
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: voice-worker
+  policyTypes:
+    - Ingress
+  ingress:
+    # Nothing. Not an oversight: the worker has no inbound application traffic
+    # (it dials the SFU and receives jobs over that connection), so the only
+    # ingress it legitimately has is the kubelet's probes and Prometheus's
+    # scrape — both granted namespace-wide in base/networkpolicy.yaml.
+    #
+    # Writing the empty rule set explicitly is the point of this object:
+    # `policyTypes: [Ingress]` with no rules denies everything else that is not
+    # allowed namespace-wide, including a stray cluster-internal caller.
+    []
+---
+# ── Egress ──────────────────────────────────────────────────────────────────
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: voice-worker-egress
+  namespace: mock-interviewer
+  labels:
+    app.kubernetes.io/part-of: mock-interviewer
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: voice-worker
+  policyTypes:
+    - Egress
+  egress:
+    # ── The SFU, including the media ports ──────────────────────────────────
+    # 7880 is the signalling API (WebSocket + Twirp) and it is the port the
+    # worker's LIVEKIT_URL names, so it is the one everybody remembers.
+    # 7881/TCP and 7882/UDP are the MEDIA path, and omitting them produces an
+    # interview with no audio — the same class of failure as an ingress that
+    # buffers WebSocket frames (NFR-9): both sides look healthy, every
+    # application-level check passes, and the candidate hears nothing. If you
+    # ever add a TURN or TCP-fallback port, this is the rule to extend.
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: livekit
+      ports:
+        - port: 7880
+          protocol: TCP
+        - port: 7881
+          protocol: TCP
+        - port: 7882
+          protocol: UDP
+    # ── Session state ───────────────────────────────────────────────────────
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: redis-sessions
+      ports:
+        - port: 6379
+          protocol: TCP
+    # ── Retrieval: banks, rubrics, follow-ups ───────────────────────────────
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: rag
+      ports:
+        - port: 8031
+          protocol: TCP
+    # ── Engines: LLM, STT, TTS ──────────────────────────────────────────────
+    # Selected by the COMPONENT label, not by pod name, and this is the one
+    # rule here that is deliberately not a list of services. The engine choice
+    # is a configuration decision (engine-endpoints.yaml): local runs
+    # ollama/stt/tts, production runs vllm-voice/whisper/kokoro, and both sets
+    # carry `app.kubernetes.io/component: engine`. A policy that had to be
+    # edited whenever that choice changed would be a landmine sitting directly
+    # under the product's core feature.
+    #
+    # The port list is the union of both sets (11434 ollama, 8000 the OpenAI
+    # -compatible STT/LLM servers, 8880 Kokoro) and is intentionally wider than
+    # any one deployment needs.
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/component: engine
+      ports:
+        - port: 11434
+          protocol: TCP
+        - port: 8000
+          protocol: TCP
+        - port: 8880
+          protocol: TCP
+    # DNS last, and never omitted: every rule above is an IP match, but the app
+    # dials by name. Without this the whole file is a very convincing outage.
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - port: 53
+          protocol: UDP
+        - port: 53
+          protocol: TCP

@@ -1,0 +1,264 @@
+# ══════════════════════════════════════════════════════════════════════════════
+# KEDA ScaledObjects — one per autoscaled Deployment, never two (NFR-2)
+# ══════════════════════════════════════════════════════════════════════════════
+#
+# ── WHY THESE ARE HERE AND NOT IN THE BASE ───────────────────────────────────
+# A ScaledObject is a CRD. Base has to apply to a cluster that has never heard
+# of KEDA — kind, and any cluster where KEDA is still an open feasibility
+# question (MOD-13 open item 1). Putting them in the base would make the base
+# fail to apply with "no matches for kind ScaledObject", which is a worse
+# failure than not having autoscaling. This component is already the one that
+# requires installed CRDs, so they live here.
+#
+# ── EXTERNAL PREREQUISITES, STATED PLAINLY ───────────────────────────────────
+# Applying this file requires:
+#   1. the KEDA operator and its CRDs;
+#   2. a Prometheus that KEDA can query (four of the five objects below use the
+#      `prometheus` scaler). Note the hop: KEDA queries PROMETHEUS, not our
+#      pods, so our namespace's NetworkPolicies do not govern it — the
+#      Prometheus service must be reachable from the KEDA namespace;
+#   3. the metric names below to actually exist. Where a name is documented it
+#      is used as documented; where it is not, it is marked.
+#
+# The failure mode of a bad trigger is benign BY DESIGN here: KEDA logs a scaler
+# error and holds the current replica count, and because the GPU engines have a
+# floor of 1 (NFR-4) the product keeps serving at the floor. That is why an
+# unverified metric name is acceptable on these four and would not be on a tier
+# whose floor is zero or whose scale-out is a latency cliff.
+#
+# ── WHAT KEDA DOES NOT DO ────────────────────────────────────────────────────
+# Scale-down goes through the scale subresource, NOT the eviction API, so the
+# PodDisruptionBudgets in base/ do not apply to it (see
+# base/voice-worker/pdb.yaml). The protection against killing a live interview
+# is preStop + terminationGracePeriodSeconds: 900 on the worker. Do not "fix"
+# slow scale-down by loosening the PDB — the PDB was never in that path.
+---
+# ── The worker: interviews in flight, not CPU (BRD-07) ──────────────────────
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: voice-worker
+  namespace: mock-interviewer
+  labels:
+    app.kubernetes.io/part-of: mock-interviewer
+spec:
+  scaleTargetRef:
+    name: voice-worker
+  # Floor 1: never zero. A worker scaled to zero is a candidate joining a room
+  # that nobody will ever answer.
+  minReplicaCount: 1
+  # A ceiling on KEDA's ask, not a promise: the Cluster Autoscaler still has to
+  # find nodes, and the GPU pool is the supply limit in practice. KEDA happily
+  # wants more replicas than the cluster can schedule, and they sit Pending —
+  # which is the correct, visible outcome.
+  maxReplicaCount: 8
+  # The signal is queue depth, and it is cheap to poll: one internal HTTP call
+  # to the API every 15 s.
+  pollingInterval: 15
+  # ── cooldownPeriod: long, and deliberately ─────────────────────────────────
+  # KEDA's scale-down path is not free on this Deployment: removing a replica
+  # triggers preStop plus up to a 900 s grace period, so a flap costs minutes
+  # each way and risks disturbing a live interview. A long cooldown plus a long
+  # stabilization window makes the scaler prefer to sit still.
+  cooldownPeriod: 600
+  advanced:
+    horizontalPodAutoscalerConfig:
+      behavior:
+        scaleDown:
+          stabilizationWindowSeconds: 600
+          policies:
+            - type: Pods
+              value: 1
+              periodSeconds: 300
+  triggers:
+    # ── metrics-api against MOD-01's scaler endpoint ─────────────────────────
+    # BRD-07: "one ScaledObject per worker Deployment, metrics-api scaler
+    # against MOD-01's /internal/scaler/voice-queue, target 1" — one pending or
+    # active interview per replica.
+    #
+    # A deliberate consequence: the scaler's source of truth is the API, not the
+    # worker, because the API owns the session store. That means a worker outage
+    # does not stop the scaler from reading the same number — good — but it also
+    # means the worker cannot scale on its own if the API is down. Accepted: with
+    # the API down there is no new session to scale for.
+    - type: metrics-api
+      metadata:
+        url: "http://api:8010/internal/scaler/voice-queue"
+        targetValue: "1"
+        # The field in the JSON response that holds the number. US-013 owns the
+        # endpoint's shape; if the field is named something else, this string is
+        # the only edit — and if the name is wrong, the scaler reports an error
+        # and the floor of 1 keeps serving.
+        valueLocation: "pendingPlusActive"
+        format: "json"
+        method: "GET"
+      # No TriggerAuthentication: the endpoint ships unauthenticated and relies
+      # on being reachable only inside the namespace (base/api/networkpolicy.yaml
+      # exposes the API to the ingress controller on 8010 and to nothing else).
+      # If US-013 puts a token on it, a TriggerAuthentication referencing a
+      # Secret is the missing half — and it belongs in this file, next to the
+      # trigger that needs it.
+---
+# ── vllm-voice: queue depth + KV-cache pressure ─────────────────────────────
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: vllm-voice
+  namespace: mock-interviewer
+  labels:
+    app.kubernetes.io/part-of: mock-interviewer
+spec:
+  scaleTargetRef:
+    name: vllm-voice
+  minReplicaCount: 1
+  maxReplicaCount: 4
+  pollingInterval: 15
+  cooldownPeriod: 600
+  advanced:
+    horizontalPodAutoscalerConfig:
+      behavior:
+        scaleDown:
+          # Same reasoning as the worker, different cost: scaling a GPU replica
+          # down means the next scale-up pays a multi-minute model load, so a
+          # short window here buys nothing and costs minutes later.
+          stabilizationWindowSeconds: 600
+  triggers:
+    # Two signals, and they mean different things. Waiting requests are demand
+    # that is not being served (add a replica). KV-cache usage near 1.0 is
+    # capacity being exhausted, which also causes waiting — but on a GPU the
+    # answer is often a bigger/additional replica rather than a longer queue.
+    # Both are vLLM's own documented metric names (MOD-13 lists exactly these).
+    - type: prometheus
+      metadata:
+        # Update for your Prometheus. In-cluster and namespaced rather than a
+        # bare service name, because KEDA runs in its own namespace.
+        serverAddress: "http://prometheus.monitoring.svc.cluster.local:9090"
+        metricName: vllm_voice_requests_waiting
+        query: sum(vllm:num_requests_waiting{namespace="mock-interviewer",pod=~"vllm-voice-.*"})
+        # Low, and intentionally: the voice budget is measured in hundreds of
+        # milliseconds, so a queue of two is already a missed turn. Waiting for a
+        # larger number before scaling means scaling after the damage.
+        threshold: "2"
+        activationThreshold: "1"
+    - type: prometheus
+      metadata:
+        serverAddress: "http://prometheus.monitoring.svc.cluster.local:9090"
+        metricName: vllm_voice_kv_cache_usage
+        query: max(vllm:gpu_cache_usage_perc{namespace="mock-interviewer",pod=~"vllm-voice-.*"})
+        # 0.8 of KV cache: past this, new requests start waiting for blocks to
+        # free rather than being batched.
+        threshold: "0.8"
+        activationThreshold: "0.5"
+---
+# ── vllm-judge: the only tier allowed to reach zero (NFR-4) ─────────────────
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: vllm-judge
+  namespace: mock-interviewer
+  labels:
+    app.kubernetes.io/part-of: mock-interviewer
+spec:
+  scaleTargetRef:
+    name: vllm-judge
+  # ── ZERO. This is the one place in this tree where zero is correct ────────
+  # It is not the hot path, its work is deferred by design, and it holds a GPU
+  # that a voice pod may need. When it is at zero the Cluster Autoscaler is free
+  # to take its node, and the low priority class tells the scheduler whose
+  # capacity it is.
+  #
+  # The cost is honest: the first call after idle pays a model load for the 14B.
+  # MOD-13 accepts that ("a slower score, not a failed interview"), and
+  # engine-endpoints.yaml records the consequence for the API's management LLM.
+  minReplicaCount: 0
+  maxReplicaCount: 2
+  pollingInterval: 30
+  # Long, because a scale-to-zero that flaps is the worst of both worlds: it pays
+  # the load every time it comes back and holds the GPU every time it stays.
+  cooldownPeriod: 900
+  triggers:
+    - type: prometheus
+      metadata:
+        serverAddress: "http://prometheus.monitoring.svc.cluster.local:9090"
+        metricName: vllm_judge_requests_waiting
+        query: sum(vllm:num_requests_waiting{namespace="mock-interviewer",pod=~"vllm-judge-.*"})
+        # Higher than the voice target on purpose: this server batches
+        # aggressively, so a small queue is normal operation rather than
+        # something to fix (05-modularization.md).
+        threshold: "8"
+        # Only wake from zero when there is real work. Below this, the call waits
+        # for the existing (absent) replica and the judge returns late — which is
+        # cheaper than loading 15 GB of weights for one score.
+        activationThreshold: "1"
+---
+# ── Whisper: in-flight transcriptions ───────────────────────────────────────
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: whisper
+  namespace: mock-interviewer
+  labels:
+    app.kubernetes.io/part-of: mock-interviewer
+spec:
+  scaleTargetRef:
+    name: whisper
+  minReplicaCount: 1
+  maxReplicaCount: 3
+  pollingInterval: 15
+  cooldownPeriod: 600
+  triggers:
+    - type: prometheus
+      metadata:
+        serverAddress: "http://prometheus.monitoring.svc.cluster.local:9090"
+        metricName: whisper_requests_in_flight
+        query: sum(speaches_requests_in_flight{namespace="mock-interviewer",pod=~"whisper-.*"})
+        # ── MARKED, NOT VERIFIED ────────────────────────────────────────────
+        # MOD-13 specifies the signal as "in-flight requests; DCGM as fallback"
+        # but does not name the metric, and the upstream image's /metrics surface
+        # has not been inspected here. Confirm the name against a running pod
+        # (`kubectl exec ... -- curl -s localhost:8000/metrics`) before trusting
+        # this trigger. If it turns out to export nothing usable, the fallback
+        # MOD-13 names is DCGM GPU utilization:
+        #     query: avg(DCGM_FI_DEV_GPU_UTIL{...})
+        # with a threshold around 70, which needs the DCGM exporter deployed.
+        threshold: "2"
+        activationThreshold: "1"
+---
+# ── Kokoro: in-flight syntheses ─────────────────────────────────────────────
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: kokoro
+  namespace: mock-interviewer
+  labels:
+    app.kubernetes.io/part-of: mock-interviewer
+spec:
+  scaleTargetRef:
+    name: kokoro
+  minReplicaCount: 1
+  maxReplicaCount: 4
+  pollingInterval: 15
+  # Shorter than the worker's: TTS calls are seconds long, not minutes, so a
+  # quiet spell here genuinely means the queue is gone. The stabilization window
+  # below is what keeps it from reacting to the gap between two sentences.
+  cooldownPeriod: 300
+  advanced:
+    horizontalPodAutoscalerConfig:
+      behavior:
+        scaleDown:
+          stabilizationWindowSeconds: 300
+  triggers:
+    - type: prometheus
+      metadata:
+        serverAddress: "http://prometheus.monitoring.svc.cluster.local:9090"
+        metricName: kokoro_requests_in_flight
+        # MARKED, NOT VERIFIED — same caveat as whisper above, and the same
+        # verification step. This is the tier where an unverified trigger is
+        # least comfortable, because it has the highest call rate in the system
+        # (per SENTENCE, not per turn), so it is also the tier most likely to
+        # need the scale-out.
+        query: sum(kokoro_requests_in_flight{namespace="mock-interviewer",pod=~"kokoro-.*"})
+        # Low: synthesis is per sentence, and the budget is 200 ms of first
+        # audio. Two sentences waiting is already a candidate hearing a pause.
+        threshold: "2"
+        activationThreshold: "1"

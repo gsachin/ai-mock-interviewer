@@ -1,0 +1,44 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: livekit
+  namespace: mock-interviewer
+  labels:
+    app.kubernetes.io/name: livekit
+    app.kubernetes.io/component: sfu
+    app.kubernetes.io/part-of: mock-interviewer
+spec:
+  # ClusterIP. The base declares no load-balancer annotations and no
+  # LoadBalancer type: for the media service that is one of the four sanctioned
+  # overlay knobs in US-019 (the LB must be the MEDIA service, not the API
+  # service — a mistake that is invisible until a candidate cannot connect), and
+  # kind has no LB provider anyway.
+  #
+  # Local limitation, stated plainly: the browser cannot reach 7882/UDP through
+  # a ClusterIP Service, and `kubectl port-forward` does not carry UDP. So the
+  # local stack exercises the orchestration — registration, token validation,
+  # drain, probes — not the real media path. That is the same boundary
+  # kind-config.yaml draws in its own words ("Real media path … is a cloud
+  # concern; locally we take the TCP-over-ingress path").
+  #
+  # For a browser session against the local cluster, the TCP path is the one
+  # that works: 7881/TCP is reachable in-cluster, and US-016's ingress sets
+  # proxy-buffering off plus 3600 s timeouts for exactly this route.
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: livekit
+  ports:
+    - name: http
+      port: 7880
+      targetPort: http
+      protocol: TCP
+    # Signalling rides 7880 (WebSocket + Twirp); 7881 is the TCP media
+    # fallback: a browser behind a proxy that blocks UDP still gets audio.
+    - name: rtc-tcp
+      port: 7881
+      targetPort: rtc-tcp
+      protocol: TCP
+    - name: rtc-udp
+      port: 7882
+      targetPort: rtc-udp
+      protocol: UDP

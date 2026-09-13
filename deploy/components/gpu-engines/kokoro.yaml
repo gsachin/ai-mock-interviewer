@@ -1,0 +1,223 @@
+# ── Kokoro — TTS on GPU (MOD-07) ────────────────────────────────────────────
+#
+# The highest call rate in the system: synthesis is per SENTENCE, not per turn,
+# because the interviewer streams its reply sentence by sentence. Its stage
+# budget is the one CPU Kokoro misses by an order of magnitude (~3.6 s against
+# 200 ms), which is the honest reason this engine exists at all.
+#
+# Voice quality is a product requirement, not a nicety: the natural-voice policy
+# excludes robotic voices, and `af_heart` is the preset that satisfies it. The
+# cluster changes where the model runs; it must not change what the candidate
+# hears (MOD-07).
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: kokoro
+  namespace: mock-interviewer
+  labels:
+    app.kubernetes.io/part-of: mock-interviewer
+automountServiceAccountToken: false
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: kokoro
+  namespace: mock-interviewer
+  labels:
+    app.kubernetes.io/name: kokoro
+    app.kubernetes.io/component: engine
+    app.kubernetes.io/part-of: mock-interviewer
+spec:
+  # No `replicas:` — ScaledObject-owned, floor 1.
+  revisionHistoryLimit: 3
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      # maxUnavailable: 0 matters more here than anywhere else in the tree: a
+      # missing TTS replica is silence in a live interview, and the second
+      # sentence of a reply is generated before the first has finished playing.
+      maxSurge: 1
+      maxUnavailable: 0
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: kokoro
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: kokoro
+        app.kubernetes.io/component: engine
+        app.kubernetes.io/part-of: mock-interviewer
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8880"
+        prometheus.io/path: "/metrics"
+    spec:
+      serviceAccountName: kokoro
+      automountServiceAccountToken: false
+      priorityClassName: mock-interviewer-voice-critical
+      tolerations:
+        - key: nvidia.com/gpu
+          operator: Equal
+          value: present
+          effect: NoSchedule
+      securityContext:
+        seccompProfile:
+          type: RuntimeDefault
+      terminationGracePeriodSeconds: 60
+      containers:
+        - name: kokoro
+          # ── VERIFY THIS TAG BEFORE THE FIRST GPU DEPLOY ────────────────────
+          # The CPU variant (ghcr.io/remsky/kokoro-fastapi-cpu) is pinned in
+          # docker-compose.yml; the GPU variant's tag is NOT recorded anywhere in
+          # this repository. Confirm it against the registry — a wrong tag is
+          # ImagePullBackOff, and `kubectl kustomize` cannot catch it.
+          image: ghcr.io/remsky/kokoro-fastapi-gpu:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8880
+          env:
+            # Same voice as the CPU plane and as INTERVIEW_KOKORO_VOICE: the
+            # server's default and the client's request must agree, or the voice
+            # changes depending on which one someone restarted last.
+            - name: KOKORO_VOICE
+              value: "af_heart"
+            # ── The shared weights, read-only and offline ────────────────────
+            # MOD-07/DAT-06: ~110 MB of Kokoro weights, delivered by PVC rather
+            # than downloaded per replica. The repo itself
+            # (hexgrad/Kokoro-82M) is what the prewarm Job fetches into this
+            # cache.
+            - name: HF_HOME
+              value: /models
+            - name: HF_HUB_OFFLINE
+              value: "1"
+            # The readiness probe below runs Python in this container, and the
+            # root filesystem is read-only: without this, the interpreter's
+            # attempt to write a bytecode cache is a warning at best. The probe
+            # only imports stdlib, which it can also do without writing anything.
+            - name: PYTHONDONTWRITEBYTECODE
+              value: "1"
+          # ── Startup, plus the warm synthesis check (MOD-13) ───────────────
+          # Startup: 60 × 10 s = 10 minutes (small model, but the first CUDA
+          # context on a cold node is the slow part).
+          startupProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 10
+            failureThreshold: 60
+          #
+          # READINESS: an actual synthesis, not /health. MOD-13 asks for a
+          # "warm synthesis check" and this is why it is worth the cost:
+          # /health stays green when the model loaded but the ONNX session,
+          # the voice preset or the output encoder is broken. That failure mode
+          # is a 500 on every sentence — silence in a live interview — and only
+          # exercising the real path can see it.
+          #
+          # The cost is one short synthesis per period, which is deliberately
+          # paid: TTS has the highest call rate in the system, so a false Ready
+          # here is multiplied by every sentence of every reply.
+          #
+          # `python3` and urllib rather than curl: this is a Python image and
+          # curl is not guaranteed to be present (python:slim ships neither curl
+          # nor wget). A probe that fails because a binary is missing would take
+          # the engine out of service with a perfectly healthy process.
+          readinessProbe:
+            exec:
+              command:
+                - python3
+                - -c
+                - |
+                  import json, urllib.request
+                  body = json.dumps({
+                      "model": "kokoro",
+                      "input": "ok",
+                      "voice": "af_heart",
+                      "response_format": "wav",
+                  }).encode()
+                  req = urllib.request.Request(
+                      "http://127.0.0.1:8880/v1/audio/speech",
+                      data=body,
+                      headers={"Content-Type": "application/json"},
+                  )
+                  urllib.request.urlopen(req, timeout=5).read()
+            periodSeconds: 10
+            timeoutSeconds: 8
+            failureThreshold: 3
+          # No LIVENESS probe: BRD-02's GPU exemption, and a restart here costs
+          # a model load while a busy synthesis server is not a broken one.
+          resources:
+            requests:
+              cpu: 1
+              memory: 1Gi
+              nvidia.com/gpu: 1
+            limits:
+              nvidia.com/gpu: 1
+              memory: 4Gi
+              # No CPU limit: this path is a per-sentence deadline, and a CFS
+              # quota shows up as intermittent jitter between sentences — which
+              # the candidate hears as the interviewer stumbling.
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+          volumeMounts:
+            - name: model-cache
+              mountPath: /models
+              readOnly: true
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: model-cache
+          persistentVolumeClaim:
+            claimName: model-cache
+            readOnly: true
+        - name: tmp
+          emptyDir:
+            sizeLimit: 1Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  # `kokoro`, matching INTERVIEW_TTS_BASE_URL (http://kokoro:8880/v1) in the
+  # base's engine-endpoints.yaml. The CPU variant is `tts`.
+  name: kokoro
+  namespace: mock-interviewer
+  labels:
+    app.kubernetes.io/name: kokoro
+    app.kubernetes.io/component: engine
+    app.kubernetes.io/part-of: mock-interviewer
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: kokoro
+  ports:
+    - name: http
+      port: 8880
+      targetPort: http
+      protocol: TCP
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: kokoro-ingress
+  namespace: mock-interviewer
+  labels:
+    app.kubernetes.io/part-of: mock-interviewer
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: kokoro
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: voice-worker
+      ports:
+        - port: 8880
+          protocol: TCP

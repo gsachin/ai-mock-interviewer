@@ -1,0 +1,189 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: api
+  namespace: mock-interviewer
+  labels:
+    app.kubernetes.io/name: api
+    app.kubernetes.io/component: management-api
+    app.kubernetes.io/part-of: mock-interviewer
+spec:
+  # No `replicas:` — the HPA owns the count (NFR-2). A number here would be
+  # overwritten by the first scale event and would then disagree with the
+  # running state, which is how a manifest starts lying. overlays/local sets one
+  # explicitly, where the point is a single pod on a laptop.
+  revisionHistoryLimit: 3
+  # Long enough to cover a cold image pull plus boot on a slow registry; short
+  # enough that a genuinely broken rollout fails while the operator is still
+  # watching it, with the previous ReplicaSet still serving (`rollout undo`).
+  progressDeadlineSeconds: 600
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: api
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: api
+        app.kubernetes.io/component: management-api
+        app.kubernetes.io/part-of: mock-interviewer
+      annotations:
+        # Portable scrape config, and the DEFAULT one: the Prometheus Operator
+        # is not installed everywhere, and an annotation-based scrape works with
+        # any Prometheus, including the one a platform team already runs
+        # (BRD-13). The ServiceMonitor in base/observability is the opt-in
+        # version for clusters that do run the Operator — both are shipped, and
+        # the annotation is the one that must keep working.
+        #
+        # /metrics does not exist yet: the route lands with US-015. Until then
+        # these targets 404, which is why the annotation is written now rather
+        # than "when the route lands" — the scrape side is then already correct
+        # and the only change left is the route itself.
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8010"
+        prometheus.io/path: "/metrics"
+    spec:
+      serviceAccountName: api
+      automountServiceAccountToken: false
+      # 45 s rather than the 30 s default: in-flight HTTP requests (an interview
+      # webhook, a slow /skills call) get to finish instead of being cut.
+      terminationGracePeriodSeconds: 45
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        # fsGroup matches the image's uid:gid (the Dockerfile creates app with
+        # 10001:10001). It matters for mounted volumes — it is what makes the
+        # emptyDir below writable by the process regardless of how the kubelet
+        # created it.
+        fsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      # Soft spread across nodes with `ScheduleAnyway`: with 0 this is a no-op on
+      # a single-node cluster, and it stops all replicas landing on one node when
+      # there are several — which the local kind cluster exists partly to
+      # demonstrate. `DoNotSchedule` would be wrong here: it would leave pods
+      # Pending on a 1-node cluster for no benefit.
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: api
+      containers:
+        - name: api
+          image: mock-interviewer-api:dev
+          # Side-loaded into the node with `kind load docker-image`, so there is
+          # nothing to pull and Never/IfNotPresent are equivalent — except that
+          # IfNotPresent also does the right thing on a target with a registry.
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8010
+          envFrom:
+            - configMapRef:
+                name: app-config
+            - configMapRef:
+                name: engine-endpoints
+          env:
+            # The LiveKit pair is mounted from the one Secret the SFU also uses;
+            # see secrets/livekit-keys.yaml for why it must not be split.
+            - name: LIVEKIT_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: livekit-keys
+                  key: LIVEKIT_API_KEY
+            - name: LIVEKIT_API_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: livekit-keys
+                  key: LIVEKIT_API_SECRET
+            - name: RAG_MCP_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: rag-token
+                  key: RAG_MCP_TOKEN
+          # ── Probes ───────────────────────────────────────────────────────
+          # ALL THREE POINT AT /health TODAY. THIS IS DELIBERATE.
+          #
+          # /healthz and /readyz do not exist yet — they arrive with US-006, and
+          # /health (which returns a hardcoded 200) is the only endpoint there
+          # is. Pointing readiness at /readyz now would 404 on every pod, no
+          # replica would ever be Ready, and with maxUnavailable: 0 the rollout
+          # would hang forever: a cluster that looks green and serves nothing.
+          #
+          # When US-006 lands, change exactly this:
+          #   startupProbe   → /healthz   (nothing else changes)
+          #   livenessProbe  → /healthz   (depends on NOTHING: a Redis or RAG
+          #                                blip must never restart API pods)
+          #   readinessProbe → /readyz    (per-dependency report: session_store
+          #                                and banks required, rag optional per
+          #                                INTERVIEW_READY_REQUIRES_RAG)
+          # Thresholds below are already the ones US-006 specifies, so only the
+          # paths move.
+          startupProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 5
+            timeoutSeconds: 2
+            failureThreshold: 24 # 2 min: the image is local, boot is seconds
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 10
+            timeoutSeconds: 2
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 5
+            timeoutSeconds: 2
+            failureThreshold: 2
+          resources:
+            requests:
+              cpu: 250m
+              memory: 512Mi
+            limits:
+              # A CPU limit is set here on purpose, and it is the opposite of
+              # the worker's choice below: this workload is request/response
+              # with short uniform work, so a throttle shows up as a capacity
+              # signal rather than as latency jitter. The worker is the one
+              # workload where a CFS throttle is indistinguishable from a slow
+              # engine, which is why it gets requests only (NFR-5).
+              cpu: "1"
+              memory: 1Gi
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 10001
+            runAsGroup: 10001
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        # The root filesystem is read-only, so anything that writes to /tmp needs
+        # a mount. FastAPI, uvicorn's multipart handling and the media libraries
+        # all do. sizeLimit is not decoration: an unbounded emptyDir that fills
+        # is a node-level incident (the kubelet evicts pods once the node's disk
+        # pressure threshold trips), whereas a limited one evicts this pod and
+        # leaves a clear reason in its events.
+        - name: tmp
+          emptyDir:
+            sizeLimit: 256Mi
+      # Note there is no volume for /app/question_banks: the banks are baked into
+      # the image at that path and are only ever READ by the API, so a read-only
+      # root filesystem is the correct end state and no writable mount is needed.
+      # The worker is the workload that writes banks, and it gets its own cache
+      # volume — see voice-worker/deployment.yaml.

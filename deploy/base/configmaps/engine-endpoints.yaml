@@ -96,5 +96,5 @@ data:
   # with --task embed, or a hosted embedding API) is an open decision in MOD-05,
   # not something to guess at here.
   RAG_CORE_EMBED_BACKEND: "ollama"
-  OLLAMA_URL: "http://ollama:11434"
+  OLLAMA_URL: "http://host.docker.internal:11434"
   EMBED_MODEL: "nomic-embed-text"

@@ -47,6 +47,21 @@ spec:
   policyTypes:
     - Egress
   egress:
+    # The Docker host gateway, for the GPU ollama that supplies embeddings.
+    #
+    # This is not only a performance choice. The in-cluster ollama has
+    # llama3.2 and qwen2.5 but NOT nomic-embed-text, and RAG warms its
+    # keyword index by re-embedding through Ollama at boot -- so with no
+    # embedding model it hung, never bound :8031, and the startup probe
+    # killed it in a loop. A dead RAG returns no questions, so every
+    # interview wrapped immediately after the greeting. That looked like a
+    # brain.py flow bug and was not one.
+    - to:
+        - ipBlock:
+            cidr: 192.168.65.254/32
+      ports:
+        - port: 11434
+          protocol: TCP
     # ── Embeddings / reranking ──────────────────────────────────────────────
     - to:
         - podSelector:

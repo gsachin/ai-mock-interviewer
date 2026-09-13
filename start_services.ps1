@@ -48,6 +48,40 @@
     With -WithVoice -WithTunnel the launcher ALSO tunnels LiveKit (:7880)
     and restarts the management plane so /voice/token hands remote pages the
     public wss URL -- the demo becomes shareable over the internet.
+.NOTES
+    GPU TIER (read before debugging a slow or stalled interview)
+
+    Inference runs on the GPU where the GPU is, and this script already
+    follows that rule without saying so: $LLMBaseUrl is 127.0.0.1:11434, the
+    HOST ollama, which auto-detects CUDA. The cluster overlay points its pods
+    at the same place via host.docker.internal. That is deliberate and it is
+    the same shape as production, where the GPU node pool is a separate tier
+    from the app:
+
+      local (this script)   host GPU        <- ollama on 127.0.0.1:11434
+      local (kind cluster)  host GPU        <- pods reach it at
+                                               192.168.65.254 (host.docker
+                                               .internal), opened in the
+                                               worker/rag egress policies
+      production            GPU node pool   <- gpu-engines component
+
+    kind CANNOT do GPU passthrough: its nodes are Docker containers created
+    without --gpus, so they never see the card, even though plain containers
+    do. Do not try to schedule GPU workloads into kind.
+
+    Measured on this machine (RTX 5060 Ti, llama3.2:3b), same model:
+      CPU, 6 shared cores   21.8 s per turn
+      GPU                   0.14 s per turn after a 17.9 s one-off VRAM load
+    ~150x. The 1500 ms voice budget is unreachable on CPU and comfortable on
+    GPU -- so if an interview is mysteriously slow, check WHICH ollama it is
+    talking to before anything else.
+
+    The in-cluster ollama has llama3.2 and qwen2.5 but NOT
+    nomic-embed-text, which the RAG service needs for embeddings. That is
+    why RAG is pointed at the host too; without it, RAG hangs during its
+    keyword warm-up, never binds :8031, and every interview wraps
+    immediately after the greeting -- which looks like a bug in brain.py and
+    is not one.
 .PARAMETER WithKind
     Ensure a local Kubernetes (kind) cluster exists and is ready, for the
     autoscaling migration (see docs/sdlc/). Downloads kind.exe into .tools\

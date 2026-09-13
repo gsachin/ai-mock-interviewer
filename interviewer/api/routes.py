@@ -323,7 +323,17 @@ async def upload_skill(file: UploadFile = File(...)) -> dict[str, Any]:
             replace = True
     except Exception:
         pass  # RAG down — registration below will surface it as a 502
-    target.write_text(text, encoding="utf-8")
+
+    # Through the store, not a direct write (US-009/US-010). With the local
+    # backend this is the same file write as before; with S3 it is what makes
+    # an upload visible to every other replica and every worker.
+    #
+    # The ordering is deliberately unchanged -- persist, THEN register -- so a
+    # RAG failure leaves the file present and unregistered, which is exactly
+    # the state POST /skills/reconcile exists to repair. Making this
+    # transactional would invent a second recovery path for a case that
+    # already has one.
+    await srv._bank_store.put(name, text.encode("utf-8"))
 
     try:
         result = await srv._rag.register_bank(

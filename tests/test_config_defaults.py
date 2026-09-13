@@ -73,6 +73,15 @@ BASELINE_DEFAULTS = {
     # default: a stalled engine must fail fast rather than leave a candidate
     # in silence for five minutes.
     "voice_llm_timeout_s": 8.0,
+    # Bank storage (US-009/010). "local" keeps the question_banks folder
+    # authoritative, which is the pre-existing behaviour.
+    "bank_store": "local",
+    "bank_s3_bucket": None,
+    "bank_s3_prefix": "question_banks/",
+    "bank_s3_endpoint_url": None,
+    "bank_s3_region": None,
+    "bank_s3_access_key": None,
+    "bank_s3_secret_key": None,
 }
 
 

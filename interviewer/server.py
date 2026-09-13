@@ -9,13 +9,17 @@ path runs in the LiveKit agent worker). Retrieval happens in the standalone
 enterprise-rag-core MCP service; this app calls it through
 ``interviewer.rag_client.RagClient``.
 """
+import logging
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
+from interviewer import skills
 from interviewer.api.routes import router
+from interviewer.bank_store import build_bank_store
 from interviewer.config import InterviewerConfig
 from interviewer.logging_setup import configure_logging
 from interviewer.rag_client import RagClient
@@ -26,7 +30,36 @@ from interviewer.session_store import InMemorySessionStore, RedisSessionStore
 # local behaviour is unchanged.
 configure_logging("api")
 
-app = FastAPI(title="mock-interviewer", version="0.1.0")
+log = logging.getLogger(__name__)
+
+
+@asynccontextmanager
+async def _lifespan(_app: FastAPI):
+    """Materialise the bank cache at startup, and keep it fresh.
+
+    The refresh is what makes the cross-replica promise true:
+    ``discover_local_banks`` and ``domain_from_room`` read the folder directly
+    and never call the store, so without a trigger the cache would only ever
+    move on a write THIS process made -- which is precisely the single-replica
+    assumption the bank store exists to remove.
+
+    Startup-only, deliberately, and the limitation is worth stating plainly:
+    this converges a pod that RESTARTS. A long-lived replica picks up another
+    replica's upload only when something calls the store (an upload, a
+    /skills read on the local backend, or the next restart). A periodic
+    refresh task is the remaining piece.
+    """
+    try:
+        await _bank_store.refresh(force=True)
+    except Exception:
+        # Never block startup on bank convergence: a replica that can serve
+        # with stale banks is strictly better than one that will not boot.
+        log.warning("initial bank cache refresh failed; serving local copies",
+                    exc_info=True)
+    yield
+
+
+app = FastAPI(title="mock-interviewer", version="0.1.0", lifespan=_lifespan)
 
 config = InterviewerConfig.from_env()
 
@@ -48,6 +81,14 @@ _rag = RagClient(config.rag_mcp_url, token=config.rag_mcp_token)
 _store = (RedisSessionStore(config.redis_url)
           if config.session_store == "redis"
           else InMemorySessionStore())
+
+# Banks (US-009/US-010). With bank_store=s3 this is a CachedBankStore that
+# mirrors object storage into the folder skills.bank_dir() already reads, so
+# discover_local_banks() and voice.agent.domain_from_room() need no changes --
+# authority moves, the reading code does not.
+#
+# Module-level for the same seam-testing reason as _store/_rag.
+_bank_store, _bank_read_dir = build_bank_store(config, skills.bank_dir())
 
 # Origins come from config, defaulting to the four that used to be hardcoded
 # here. See InterviewerConfig.cors_origins for why the default is those and why

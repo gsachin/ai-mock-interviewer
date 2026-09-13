@@ -121,6 +121,18 @@ class InterviewerConfig:
     # Credentials cannot be combined with a wildcard origin, so this stays a
     # separate opt-in rather than something inferred from `*` being present.
     cors_allow_credentials: bool = False
+    # Bank storage (US-009/US-010). "local" is the pre-existing behaviour: the
+    # question_banks folder IS the source of truth, which is correct for a
+    # single node and for the Windows dev flow. "s3" makes an S3-compatible
+    # bucket authoritative and materialises it into a local cache directory, so
+    # every replica and every worker sees the same banks.
+    bank_store: str = "local"           # local | s3
+    bank_s3_bucket: str | None = None
+    bank_s3_prefix: str = "question_banks/"
+    bank_s3_endpoint_url: str | None = None   # MinIO on-prem, or unset for AWS
+    bank_s3_region: str | None = None
+    bank_s3_access_key: str | None = None
+    bank_s3_secret_key: str | None = None
 
     @classmethod
     def from_env(cls, environ: dict[str, str] | None = None) -> "InterviewerConfig":
@@ -163,4 +175,12 @@ class InterviewerConfig:
             cors_origins=_as_origins(env.get("INTERVIEW_CORS_ORIGINS")),
             cors_allow_credentials=_as_bool(
                 env.get("INTERVIEW_CORS_ALLOW_CREDENTIALS")),
+            bank_store=env.get("INTERVIEW_BANK_STORE", "local"),
+            bank_s3_bucket=env.get("INTERVIEW_BANK_S3_BUCKET"),
+            bank_s3_prefix=env.get("INTERVIEW_BANK_S3_PREFIX",
+                                   "question_banks/"),
+            bank_s3_endpoint_url=env.get("INTERVIEW_BANK_S3_ENDPOINT_URL"),
+            bank_s3_region=env.get("INTERVIEW_BANK_S3_REGION"),
+            bank_s3_access_key=env.get("INTERVIEW_BANK_S3_ACCESS_KEY"),
+            bank_s3_secret_key=env.get("INTERVIEW_BANK_S3_SECRET_KEY"),
         )

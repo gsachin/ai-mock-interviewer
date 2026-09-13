@@ -36,6 +36,12 @@ api = [
 web = [
     "streamlit>=1.40",        # web/streamlit_app.py — interactive text-mode interview UI
 ]
+s3 = [
+    # INTERVIEW_BANK_STORE=s3 only. Imported lazily by S3BankStore, exactly as
+    # RedisSessionStore lazily imports redis, so the package stays importable
+    # and fully functional on the local/memory path without this installed.
+    "aioboto3>=13,<16",
+]
 voice = [
     "livekit-agents>=1",      # Phase 3: LiveKit agent worker (VAD, turn detection, rtc)
     "livekit-api>=1",         # AccessToken for the /voice/token endpoint

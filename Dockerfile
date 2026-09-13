@@ -154,6 +154,22 @@ RUN python -m pip install -e ".[mcp,chroma,qdrant,elasticsearch,redisvl]"
 RUN enterprise-rag-core download-model || true
 ENV RAG_CORE_RERANK_MODEL_PATH=/rag/models/reranker/minilm-int8.onnx
 
+# The reranker's TOKENIZER is a second, separate artifact: `download-model`
+# fetches only the .onnx, and the tokenizer is pulled from HuggingFace lazily
+# at first use. In-cluster that request is denied -- correctly -- by the
+# rag-egress NetworkPolicy, so the service retried five times and died with
+# "'[Errno 101] Network is unreachable' ... cross-encoder/ms-marco-MiniLM-L-6-v2".
+#
+# Baking it is the right fix rather than permitting egress to huggingface.co:
+# a locked-down namespace should not need the public internet to start, and the
+# artifact is tiny and immutable. Populate the HF cache at BUILD time, when the
+# build host does have network, then run offline.
+ENV HF_HOME=/opt/hf
+RUN python -c "from huggingface_hub import snapshot_download; snapshot_download('cross-encoder/ms-marco-MiniLM-L-6-v2')"
+# Offline from here on: a cache miss should fail fast and loudly at startup
+# rather than hang on a retry loop against an unreachable host.
+ENV HF_HUB_OFFLINE=1
+
 USER 10001:10001
 EXPOSE 8031
 

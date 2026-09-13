@@ -188,6 +188,17 @@ spec:
               mountPath: /models
             - name: tmp
               mountPath: /tmp
+            # ollama writes a signing key to $HOME/.ollama (id_ed25519) on
+            # first start -- separate from the model store, so the /models PVC
+            # does not cover it. With readOnlyRootFilesystem the mkdir fails:
+            #   Error: could not create directory mkdir /root/.ollama:
+            #          read-only file system
+            # and the container crash-loops before serving anything. A tiny
+            # emptyDir is the right shape: the key is a few hundred bytes, is
+            # regenerated if lost, and must NOT live in the model PVC where it
+            # would outlive the pod for no benefit.
+            - name: ollama-home
+              mountPath: /root/.ollama
       volumes:
         - name: models
           persistentVolumeClaim:
@@ -195,6 +206,9 @@ spec:
         - name: tmp
           emptyDir:
             sizeLimit: 2Gi
+        - name: ollama-home
+          emptyDir:
+            sizeLimit: 64Mi
 ---
 apiVersion: v1
 kind: Service

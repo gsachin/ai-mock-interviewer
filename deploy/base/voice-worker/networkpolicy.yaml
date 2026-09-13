@@ -1,6 +1,15 @@
-# kindnet does not enforce NetworkPolicy — see the warning in
-# base/networkpolicy.yaml. These rules are syntax-checked locally and nothing
-# more.
+# CORRECTION, and this comment previously said the opposite: **kindnet DOES
+# enforce NetworkPolicy** on kind v0.33.0 / k8s v1.37.0. The old text claimed
+# these rules were "syntax-checked locally and nothing more", which is wrong
+# in the most expensive possible direction — it invites reading a green local
+# run as proof of a network posture that is actually being enforced.
+#
+# The evidence was a TCP TIMEOUT to a port `netstat` showed as LISTENing: a
+# drop, not a refusal. Two real outages were hidden behind the old assumption
+# (an unreachable SFU, then an unreachable session store), and a third
+# surfaced while adding the rules below — NetworkPolicy is BIDIRECTIONAL, so
+# an egress rule without its matching ingress rule looks correct in isolation
+# and drops packets at runtime.
 ---
 # ── Ingress: control plane only ─────────────────────────────────────────────
 apiVersion: networking.k8s.io/v1
@@ -70,6 +79,33 @@ spec:
               app.kubernetes.io/name: api
       ports:
         - port: 8010
+          protocol: TCP
+    # The Docker Desktop host gateway, for GPU inference services running on
+    # the HOST rather than in the cluster.
+    #
+    # WHY THE HOST AND NOT A POD: kind nodes are Docker containers created
+    # without `--gpus`, so they cannot see the GPU at all -- even though plain
+    # containers can (`docker run --gpus all` reports the RTX 5060 Ti). Nested
+    # GPU passthrough through Docker Desktop's WSL2 layer is not something to
+    # build a dev loop on.
+    #
+    # So the GPU tier lives beside the cluster, not in it, and pods reach it
+    # over the host gateway. That is the same shape as production, where the
+    # GPU node pool is a separate tier -- the difference is only which side of
+    # the boundary the hardware sits on.
+    #
+    # 192.168.65.254 is Docker Desktop's host gateway. On Linux or a
+    # different runtime, replace it with that platform's gateway address
+    # (the local overlay patches this).
+    - to:
+        - ipBlock:
+            cidr: 192.168.65.254/32
+      ports:
+        - port: 11434
+          protocol: TCP
+        - port: 8000
+          protocol: TCP
+        - port: 8880
           protocol: TCP
     # ── The SFU, including the media ports ──────────────────────────────────
     # 7880 is the signalling API (WebSocket + Twirp) and it is the port the

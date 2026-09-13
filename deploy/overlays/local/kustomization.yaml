@@ -74,9 +74,9 @@ configMapGenerator:
       # — which is correct here and in production, for the reason recorded in
       # engine-endpoints.yaml: judge_model can only rename a model on the SAME
       # base URL.
-      - INTERVIEW_LLM_BASE_URL=http://ollama:11434/v1
+      - INTERVIEW_LLM_BASE_URL=http://host.docker.internal:11434/v1
       - INTERVIEW_LLM_MODEL=qwen2.5:14b
-      - INTERVIEW_VOICE_LLM_BASE_URL=http://ollama:11434/v1
+      - INTERVIEW_VOICE_LLM_BASE_URL=http://host.docker.internal:11434/v1
       - INTERVIEW_VOICE_LLM_MODEL=llama3.2:3b
       # ── STT / TTS providers ───────────────────────────────────────────────
       # `faster-whisper` and `kokoro`, NOT `whisper-http` / `kokoro-http`, and

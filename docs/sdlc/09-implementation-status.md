@@ -1,117 +1,139 @@
 # Implementation Status — per user story
 
-> **As of:** 2026-09-13 · **Branch:** `auto-scalling-arch` · **Plan:** `plan-state.md` · **Suite:** 221 passing
+> **As of:** 2026-09-13 · **Branch:** `auto-scalling-arch` @ `0fd00e8` · **Plan:** `plan-state.md` · **Suite:** 236 passing
 >
-> Every status below was **verified by inspection or execution**, not recalled. Where a story is partial, the row names exactly which half exists.
+> Every status was **verified by inspection or execution**, not recalled. Where a story is partial, the row names exactly which half exists.
 
 ## Headline
 
 | Status | Count | Stories |
 |---|---|---|
 | ✅ **Done and verified** | 9 | US-001, US-003, US-004, US-005, US-006, US-007, US-008, US-009, US-019 |
-| ✅ **Done — one path unexercised** | 1 | US-010 (S3 backend written, never run) |
+| ✅ **Done — one path unexercised** | 2 | US-010 (S3 backend never run), US-011 (live audio round-trip never run) |
 | 🟡 **Partial — manifest/infra only** | 5 | US-014, US-015, US-016, US-017, US-018 |
 | ⚠️ **Written, never run** | 1 | US-002 |
-| ❌ **Not started** | 4 | US-011, US-012, US-013, US-020 |
+| ❌ **Not started** | 3 | US-012, US-013, US-020 |
 
-**10 of 20 stories complete. Waves 0 and 1 are finished; Wave 2 has not begun.**
+**11 of 20 stories complete. Waves 0, 1 done; Wave 2's pivotal story done; Wave 3 not started.**
 
-## The structural picture has changed
+## The structural picture
 
-The previous version of this document found that "the deployment is running ahead of the code" — every cluster-tier story manifest-shaped while every application-tier story was untouched. **Wave 1 has largely closed that.** The API tier is now genuinely stateless (US-004), correctly probed (US-006), configurable (US-007), pooled and metric-isolated (US-008), and its uploads are shareable across replicas (US-009/010). `BRD-01`–`BRD-04` are met.
+Two waves ago the finding was "the deployment is running ahead of the code across every tier". **The API tier is now genuinely converged** — stateless, probed, configurable, pooled, shareable uploads. `BRD-01`–`BRD-04` are met and verified in-cluster.
 
-**The inversion now sits one tier down — at the worker.** Waves 2 and 3 are untouched, while their manifests already exist:
+**The inversion is now confined to the worker tier**, and it has changed character: it is no longer *blocked*, it is merely *not done*. US-011 removed the reason these three could not be built:
 
-| Manifest that exists | Code it describes | Consequence today |
+| Manifest that exists | Code it describes | State |
 |---|---|---|
-| `voice-worker/deployment.yaml` with `terminationGracePeriodSeconds: 900` | `control.py` does not exist | **The worker cannot drain.** Scale-down kills interviews |
-| `base/observability/*` + scrape annotations | `metrics.py` does not exist | Nothing is exported; the SLO evaluates over empty series |
-| `keda-scaledobjects.yaml` | `/internal/scaler/voice-queue` does not exist; KEDA not installed (0 CRDs) | The worker does not autoscale |
+| `voice-worker/deployment.yaml`, grace 900 s, `maxUnavailable: 0` | `control.py` absent | **Was blocked by US-011. Now merely unbuilt** — the finite `load_threshold` it needed exists |
+| `base/observability/*`, scrape annotations | `metrics.py` absent | Unbuilt. Also no Prometheus in-cluster, so there is no scraper either |
+| `keda-scaledobjects.yaml` | scaler endpoint absent; KEDA not installed (0 CRDs) | Unbuilt. No longer blocked in principle |
 
-None of those is a defect in the manifests — they are honest placeholders with comments naming their story. But they are why "the cluster is deployed" and "the cluster scales" are currently different claims.
+The difference matters for planning: these are now ordinary backlog, not dependencies on unfinished work.
 
 ## Wave 0 — Containerize
 
 | Story | Status | Evidence |
 |---|---|---|
-| **US-001** Container images | ✅ **Done, verified** | Multi-target `Dockerfile` (`base → api｜worker｜rag`). api **287MB**, worker **1.78GB**; on the kind nodes **67.9MB vs 466MB**. `av`/`livekit.agents` gate passes in-image (av 15.1.0, livekit-agents 1.8.1). Banks verified present and served. **Exceeded the story**: dependency layers split so the API no longer carries the voice stack; native deps moved to the layers that use them. |
-| **US-002** Local Compose stack | ⚠️ **Written, never run** | `docker-compose.yml` complete with core / `engines` / `rag` / `legacy` profiles and env vars identical to the ConfigMaps. **`docker compose up` has never been executed** — re-confirmed this pass (no compose services running). No configuration of it is verified. |
-| **US-003** Config-defaults tripwire | ✅ **Done, verified** | `tests/test_config_defaults.py` — every default asserted against its baseline literal, plus a guard failing when a field is added without a Windows-flow decision. It caught four would-be drift events across Waves 0–1. **Suite: 221 passed, 6 deselected.** |
+| **US-001** Container images | ✅ **Done, verified** | Multi-target `Dockerfile`. api **287MB**, worker **1.78GB**; on-node **67.9MB vs 466MB**. In-image `av`/`livekit.agents` gate passes. Banks present and served. **Exceeded**: dependency layers split so the API no longer carries the voice stack. |
+| **US-002** Local Compose stack | ⚠️ **Written, never run** | Complete with core / `engines` / `rag` / `legacy` profiles and env vars identical to the ConfigMaps. **`docker compose up` has still never been executed.** |
+| **US-003** Config-defaults tripwire | ✅ **Done, verified** | Every default asserted against its baseline literal, plus a guard when a field is added without a Windows-flow decision. It has now caught five would-be drift events. |
 
 ## Wave 1 — Statelessness — **COMPLETE**
 
 | Story | Status | Evidence |
 |---|---|---|
-| **US-004** Sessions to Redis | ✅ **Done, verified in-cluster** | `_registry` removed; `_store` is the `SessionStore` seam. **Two replicas, session created via the Service, `redis-sessions dbsize=1` with the exact `to_dict()` payload, 8/8 reads across both replicas.** |
-| **US-005** Session serializer | ✅ **Done, verified** | `Session.to_dict()`/`from_dict()`. Unknown keys tolerated (rolling deploys); unknown `state` raises rather than silently rewinding an interview. |
-| **US-006** Probes + router | ✅ **Done, verified in-cluster** | `/healthz` (checks nothing), `/readyz` (per-dependency, 503 on failure), `/health` unchanged as a legacy alias. Routes on one `APIRouter` declared before the static mount. **Verified by taking Redis down: `/readyz` → 503 naming `store: TimeoutError` while reporting `banks: ok`; `/healthz` → 200; the pod left the Ready set; Service endpoints went EMPTY; recovered to 1/1 on restore.** |
-| **US-007** Config CORS | ✅ **Done** | Origins from config, defaulting to the previously hardcoded four. An explicitly empty value means "no CORS" and is respected rather than falling back — otherwise CORS could not be turned *off*, which is what a same-origin ingress deployment wants. |
-| **US-008** httpx pooling + metrics + MCP session | ✅ **Done** | Shared pooled client per engine with explicit `Limits`; **persistent MCP session** (removes a full JSON-RPC `initialize()` handshake from *every* retrieval — the highest-ROI latency fix in the migration, and it needs no GPU); **per-call metrics**, the hard prerequisite for US-011. Two tests prove two overlapping calls on one engine report distinct objects. |
-| **US-009** BankStore protocol | ✅ **Done** | `BankStore` protocol + `LocalBankStore` (default, pre-existing behaviour) + `CachedBankStore`. Resolves its root per call so the existing `monkeypatch.setattr(skills, "BANK_DIR", ...)` seam keeps working. |
-| **US-010** Object-storage backend | ✅ **Done — S3 path unexercised** | `S3BankStore` written with a lazy `aioboto3` import and a new `[s3]` extra. **`CachedBankStore` is tested against a fake backend, which proves the cache contract — but `S3BankStore` itself has never run against a real S3/MinIO**, because none is available and `aioboto3` is not installed. |
+| **US-004** Sessions to Redis | ✅ **Verified in-cluster** | `redis-sessions dbsize=1` with the exact `to_dict()` payload; 8/8 reads across two replicas via the Service. |
+| **US-005** Session serializer | ✅ **Verified** | Unknown keys tolerated (rolling deploys); unknown `state` raises rather than silently rewinding an interview. |
+| **US-006** Probes + router | ✅ **Verified in-cluster** | **Verified by failure, not success**: Redis down → `/readyz` 503 naming `store: TimeoutError` while reporting `banks: ok`; `/healthz` stayed 200; pod left the Ready set; Service endpoints went EMPTY; recovered on restore. |
+| **US-007** Config CORS | ✅ Done | An explicitly empty value means "no CORS" and is respected — otherwise it could not be turned *off*, which a same-origin ingress deployment wants. |
+| **US-008** Pooling + metrics + MCP session | ✅ Done | Persistent MCP session removes a full JSON-RPC handshake from *every* retrieval. Per-call metrics is the prerequisite US-011 depended on. |
+| **US-009** BankStore protocol | ✅ Done | Resolves its root per call so the existing `monkeypatch.setattr(skills, "BANK_DIR", ...)` seam keeps working. |
+| **US-010** Object-storage backend | ✅ **S3 path unexercised** | `CachedBankStore` tested against a fake backend; **`S3BankStore` has never touched real S3/MinIO**. |
 
-**Known gap inside Wave 1:** the bank cache refresh is **startup-only**. It converges a pod that restarts; a long-lived replica only picks up another replica's upload when something calls the store. A periodic refresh task is outstanding, so the cross-replica promise currently holds for restarts but **not for a running process**.
+**Gap inside Wave 1:** the bank cache refresh is **startup-only**. It converges a pod that restarts; a long-lived replica picks up another replica's upload only when something calls the store. The cross-replica promise holds for restarts, **not for a running process**.
 
-## Wave 2 — GPU engine services — **NOT STARTED**
+## Wave 2 — GPU engine services
 
 | Story | Status | Evidence |
 |---|---|---|
-| **US-011** Remote engine adapters | ❌ **Not started — infra half done** | **0** references to `whisper-http`/`kokoro-http` or remote adapters. The worker still runs STT/TTS **in-process**. *Infra*: the `cpu-engines` component deploys Ollama, Speaches and Kokoro — all **Running** in kind — and the engine base URLs are already in the ConfigMap, so the flip is a two-value change once the adapters exist. |
+| **US-011** Remote engine adapters | ✅ **Done — live audio round-trip unverified** | `RemoteWhisperSTT` (`whisper-http`) and `RemoteKokoroTTS` (`kokoro-http`) as additive branches; PCM WAV-wrapped via a new stdlib helper; Kokoro's 24 kHz output converted with the existing tested `wav_to_s16le48k`; `kokoro-http` added to `NATURAL_VOICE_PROVIDERS` (same model, so `af_heart` carries over — a hosting change, not a vendor change). Process-level engines with a per-room fallback. Dead `resolve_stt` deleted. **`load_threshold` inf → 0.95.** Monkey-patch guarded; `livekit-agents` pinned to a minor. |
 
-**Why this is the pivotal story.** It is what makes the worker CPU-only, gives it a sub-2s cold start, and makes `load_threshold` safe to set finite — which is what unblocks US-014 (drain) and US-018 (autoscaling). **`REC-05` cannot be applied until it lands.** Its stated prerequisite (per-call metrics) is now discharged and directly tested.
+**Why this was pivotal, and what it unblocked.** The worker is now CPU-only and I/O-bound, which is what makes a finite dispatch gate accurate — and therefore what unblocks US-014 and US-018. Reading livekit's source explained the original `float("inf")` workaround precisely: `_default_load_threshold = ServerEnvOption(dev_default=math.inf, prod_default=0.7)`, so the 0.7 gate the author disabled is the **production** default, and the bursts were the in-process engines. Leaving it infinite is now actively wrong with more than one replica.
+
+**What is NOT verified:** the live audio round-trip through Speaches and Kokoro. The engines run and are wired (`INTERVIEW_STT_PROVIDER=whisper-http` confirmed on the running pod), but no interview has been driven end to end through them. See §"The e2e attempt".
 
 ## Wave 3 — Durability — **NOT STARTED**
 
 | Story | Status | Evidence |
 |---|---|---|
-| **US-012** Voice session persistence | ❌ Not started | `agent.py` still keys the session by `ctx.room.name` (4 occurrences), not the API's 12-hex id — the mismatch that makes persistence write to unreachable keys. Summary still only logged. **`GET /sessions/{id}` remains permanently empty for voice rooms (open item P4).** |
+| **US-012** Voice session persistence | ❌ Not started | `agent.py` still keys the session by `ctx.room.name`, not the API's 12-hex id — the mismatch that makes persistence write to unreachable keys. **`GET /sessions/{id}` remains permanently empty for voice rooms (open item P4).** |
 | **US-013** Checkpointing + interrupted snapshot | ❌ Not started | No `on_checkpoint`; `_on_shutdown` writes nothing. |
-| **US-014** Graceful drain + reconcile | 🟡 **Partial — manifest only** | `terminationGracePeriodSeconds: 900` and `maxUnavailable: 0` are in the deployment. **`interviewer/voice/control.py` does not exist** (re-confirmed this pass), so `/readyz`, `POST /drain` and the `preStop` hook are placeholders. The PDB/KEDA reasoning is documented but unexercised. |
+| **US-014** Graceful drain + reconcile | 🟡 **Partial — manifest only** | Grace period and `maxUnavailable: 0` are in place; **`control.py` does not exist**, so `/readyz`, `POST /drain` and `preStop` are placeholders. **Now unblocked by US-011.** |
 
 ## Wave 4 — Cluster
 
 | Story | Status | Evidence |
 |---|---|---|
-| **US-015** Metrics + SLO | 🟡 **Partial — manifest only** | ServiceMonitor + PrometheusRule exist; pods carry scrape annotations. **`interviewer/metrics.py` does not exist** (re-confirmed), and there is no `/metrics` endpoint. Nothing is exported and the SLO would evaluate over empty series. **Also**: no Prometheus is installed in the cluster, so even once `/metrics` exists there is no scraper. |
-| **US-016** LiveKit production | 🟡 **Partial** | `base/livekit/` runs `1/1`, the key/`LIVEKIT_KEYS` mapping is documented, the `LIVEKIT_PORT` collision is fixed, and an ingress NetworkPolicy was added. **TLS/`wss://`, ingress, cert-manager and multi-node are not done**, and it still runs `--dev`. |
-| **US-017** RAG multi-replica | 🟡 **Partial — deployed, single replica** | Image builds with all backend extras and the reranker tokenizer baked; Deployment/Service/HPA exist. **Qdrant and Elasticsearch are not deployed** — the local overlay uses chroma + in-memory BM25 — so the service is single-replica and `BRD-10` is unmet. |
-| **US-018** Worker autoscaling | 🟡 **Partial — manifest only** | `keda-scaledobjects.yaml` exists. **KEDA is not installed (0 CRDs)** and **`GET /internal/scaler/voice-queue` does not exist**, so the `metrics-api` trigger has no source. The worker does not autoscale. |
-| **US-019** Kustomize base + overlays | ✅ **Done, verified** | 47 files. All five targets build clean (base 44, cpu-engines 13, gpu-engines 26, local 53, production 70). Deployed to kind and iterated against reality. |
+| **US-015** Metrics + SLO | 🟡 **Partial — manifest only** | ServiceMonitor + PrometheusRule exist. **`metrics.py` does not exist** and no Prometheus is installed, so nothing is exported and nothing would scrape it. |
+| **US-016** LiveKit production | 🟡 **Partial** | Runs `1/1`; key mapping documented; `LIVEKIT_PORT` collision fixed; ingress policy added. **TLS/`wss://`, ingress, cert-manager, multi-node not done**; still `--dev`. |
+| **US-017** RAG multi-replica | 🟡 **Partial — deployed, single replica** | Image builds with all backend extras and the reranker tokenizer baked. **Qdrant and Elasticsearch not deployed** — chroma + in-RAM BM25 — so `BRD-10` is unmet. |
+| **US-018** Worker autoscaling | 🟡 **Partial — manifest only** | ScaledObject exists; **KEDA not installed, scaler endpoint absent**. **Now unblocked by US-011.** |
+| **US-019** Kustomize base + overlays | ✅ **Done, verified** | All five targets build clean; deployed to kind and iterated against reality. |
 | **US-020** CI pipeline | ❌ Not started | No `.github/workflows/`. |
+
+## The e2e attempt — blocked, and why that matters
+
+Attempted this session; **it did not execute**, and is recorded as blocked rather than attempted-and-assumed.
+
+The client must run **inside** the cluster because `/voice/token` returns the in-cluster `LIVEKIT_URL`, which does not resolve on a laptop. `api-ingress` admitted only `ingress-nginx`, so a `voice-worker → api:8010` rule was added. **The rule is applied and the pod labels match, but the connection times out**; deleting and recreating the policy did not make kindnet reprogram it. Other podSelector rules on this cluster work fine (worker→tts, worker→livekit opened immediately), so this is not a general kindnet failure.
+
+**Consequence:** US-011's adapters are verified by unit test and resolution check, and the engines are running and configured — but **no interview has been driven through them**. That is the single most valuable outstanding verification in this migration.
+
+**Workaround for next time:** port-forward `livekit` and `api`, patch **only** the api deployment's `LIVEKIT_URL` to `http://127.0.0.1:7880` (the worker keeps the in-cluster value), and run the client from the host.
 
 ## Unplanned work
 
-Substantial effort went into things no story enumerated.
-
 | Work | Why it existed |
 |---|---|
-| Local kind cluster + `-WithKind` launcher integration | Chosen direction; 3 nodes, k8s v1.37.0 |
-| metrics-server installed | kind ships none, so both HPAs were **inert objects** reporting `unable to fetch metrics`. Autoscaling could not have worked at all |
-| **12 defects found by deploying** | See below |
+| Local kind cluster + `-WithKind` integration | Chosen direction; 3 nodes, k8s v1.37.0 |
+| metrics-server installed | kind ships none, so both HPAs were **inert objects** |
+| **13 defects found by deploying** | Below |
 
-### The defect record — every one found by running it, none visible in a rendered manifest
+### Defect record
 
 | # | Defect | Family |
 |---|---|---|
-| 1 | `.dockerignore`'s `**/*.md` stripped all 9 question banks from the image | dependency/packaging |
-| 2 | API image carried the entire voice stack (~630MB dead weight) | dependency/packaging |
-| 3 | RAG image installed only `.[mcp]`; the overlay selects chroma → `No module named 'chromadb'` | dependency/packaging |
-| 4 | RAG image shipped no reranker tokenizer; egress correctly blocked → retry loop, then death | dependency/packaging |
-| 5 | **`redis` lived in `[dev]`, not `[api]`** — image up, probes green, 500 on the first request | dependency/packaging |
-| 6 | redis crash-looped: `chown: Operation not permitted` (`drop: [ALL]` removes `CAP_CHOWN`) | read-only-rootfs gap |
-| 7 | ollama crash-looped on a read-only `/root/.ollama` | read-only-rootfs gap |
-| 8 | livekit crash-looped: injected `LIVEKIT_PORT` collided with its own variable | injected config |
-| 9 | **No NetworkPolicy granted ingress to livekit** — Running, listening, unreachable | missing policy |
-| 10 | **No NetworkPolicy granted ingress to either Redis** — same shape, found later | missing policy |
-| 11 | `kind load` under an unchanged tag silently ignored by `IfNotPresent` | test-signal integrity |
-| 12 | `mcp`'s `read_timeout_seconds` takes a **float, not a timedelta** — caught by checking the real SDK after a fake rejected the kwarg | API contract |
+| 1 | `.dockerignore` stripped all 9 question banks from the image | packaging |
+| 2 | API image carried the entire voice stack | packaging |
+| 3 | RAG image installed only `.[mcp]`; overlay selects chroma | packaging |
+| 4 | RAG image shipped no reranker tokenizer | packaging |
+| 5 | `redis` lived in `[dev]`, not `[api]` | packaging |
+| 6 | redis: `chown: Operation not permitted` (`drop: [ALL]` removes `CAP_CHOWN`) | **unmounted data dir** |
+| 7 | ollama: read-only `/root/.ollama` | **unmounted data dir** |
+| 8 | **Speaches: `scan_cache_dir()` raises on a missing `hub/`** | **unmounted data dir** |
+| 9 | livekit: injected `LIVEKIT_PORT` collided with its own variable | injected config |
+| 10 | No NetworkPolicy granted ingress to livekit | missing policy |
+| 11 | No NetworkPolicy granted ingress to either Redis | missing policy |
+| 12 | `kind load` under an unchanged tag silently ignored by `IfNotPresent` | test-signal integrity |
+| 13 | `mcp`'s `read_timeout_seconds` takes a float, not a timedelta | API contract |
 
-**Two coherent families dominate.** Five are *a dependency declared somewhere other than where it is used*; two are *a read-only rootfs plus a data directory nobody mounted*; two are *every workload needs an ingress policy, and two did not get one*.
+**The families have consolidated into four mechanical checks:**
 
-**Every one produced something that looked healthy.** Five of the twelve were found only because a signal was distrusted rather than believed — an HTTP 200 with an empty Redis, a green build with a broken artifact, a test failure that turned out to be my bug rather than the test's.
+- **5 × packaging** — *a dependency declared somewhere other than where it is used.* One rule would catch all five.
+- **3 × unmounted data directory** — *a read-only rootfs or emptyDir missing a path the image requires.* Three occurrences is a checklist item, not coincidence.
+- **2 × missing NetworkPolicy** — *every workload needs a matching ingress policy.* A machine check over the rendered manifests.
+- **3 × one-offs** — injected config, mutable image tags, an SDK signature.
+
+**Every one produced something that looked healthy, and six were caught only because a signal was distrusted** — an HTTP 200 with an empty Redis, a green build with a broken artifact, and a test failure that turned out to be the implementation's bug rather than the test's.
 
 ## Recommendation
 
-**The case for pulling US-020 forward is now much stronger.** Twelve defects — every one caught by exercising a deployed stack, none by a green build — is a direct measurement of what the CI job in US-020 is worth, and the `e2e` job specifically would have failed on all of them. Landing the validation and e2e jobs *before* Waves 2–3 means the remaining stories get checked automatically instead of the hard way.
+**Pull US-020 forward.** Thirteen defects, every one caught by exercising a deployed stack and none by a green build, is a measurement of what the CI job is worth — and the four families above are directly mechanisable:
 
-If that is not taken, the recommended next story is **US-011**: it is unblocked, it is pivotal, and both US-014 and US-018 depend on it in ways their own manifests cannot express.
+- a manifest check asserting **every workload has an ingress policy**
+- an image-content assertion that **every import the serving path needs is in a runtime extra**
+- a lint for **read-only rootfs without a writable mount**, and for **emptyDir paths the image reads at boot**
+
+Any of those would have caught multiple defects before a cluster was involved. The `e2e` job would have caught all thirteen.
+
+If not, the highest-value remaining work is **the blocked e2e run** — not a new story. US-011 is the pivotal change and its live path is the one thing still unproven; everything in Wave 3 is built on the assumption that it works.

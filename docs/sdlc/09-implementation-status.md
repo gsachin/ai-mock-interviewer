@@ -21,7 +21,7 @@
 
 That inversion is visible in the running cluster: the worker reports `0/1 Ready`, and `base/voice-worker/deployment.yaml` carries a commented-out readiness probe because **the control server it would probe does not exist yet** (`US-014`). Several manifests reference endpoints and behaviours that are still unimplemented — they are honest placeholders with comments naming their story, not oversights.
 
-The consequence is the one flagged when we jumped to K8s manifests early: **the cluster currently deploys a service that is not yet stateless.** Multi-replica correctness (`BRD-01`) is still unmet — `server.py:54` keeps `_registry: dict[str, Session]` in process memory.
+**This is now partly closed.** US-004 removed `_registry`, and US-006 replaced the fake `/health` with real probes — so the API tier IS stateless and correctly probed (verified across two replicas). What remains inverted is the rest of the app tier: the worker still cannot drain (US-014), nothing is measured (US-015), and the scaler has no source (US-018), while all three have manifests describing them.
 
 ## Wave 0 — Containerize
 
@@ -29,18 +29,18 @@ The consequence is the one flagged when we jumped to K8s manifests early: **the 
 |---|---|---|
 | **US-001** Container images | ✅ **Done, verified** | Multi-target `Dockerfile` (`base → api｜worker｜rag`). `api` **287MB**, `worker` **1.78GB**, and **67.9MB vs 466MB** on the kind nodes. `av`/`livekit.agents` gate passes in-image (av 15.1.0, livekit-agents 1.8.1). Banks verified present and served: `/skills` returns 9. **Exceeded the story**: dependency layers split so the API no longer carries the voice stack, and native deps (`libgomp1`, `ffmpeg`) moved to the layers that use them. |
 | **US-002** Local Compose stack | ⚠️ **Written, never run** | `docker-compose.yml` complete with core / `engines` / `rag` / `legacy` profiles, CPU engine images, and env vars identical to the ConfigMaps. **`docker compose up` has never been executed** — no configuration of it is verified. |
-| **US-003** Config-defaults tripwire | ✅ **Done, verified** | `tests/test_config_defaults.py` — 37 tests asserting every default against its baseline literal, plus a guard failing when a new field is added without a Windows-flow decision. **Suite: 158 passed, 6 deselected** (121 baseline + 37). |
+| **US-003** Config-defaults tripwire | ✅ **Done, verified** | `tests/test_config_defaults.py` — 37 tests asserting every default against its baseline literal, plus a guard failing when a new field is added without a Windows-flow decision. **Suite: 192 passed, 6 deselected** (121 baseline + 71 added across US-003/004/005/006). |
 
 ## Wave 1 — Statelessness (`BRD-01`, `BRD-02`, `BRD-03`, `BRD-04`)
 
-**All seven stories not started.** Verified individually:
+Three of seven done (US-004, US-005, US-006); four remaining, verified individually:
 
 | Story | Status | Evidence |
 |---|---|---|
 | **US-004** Sessions to Redis | ✅ **Done, verified in-cluster** | `_registry` removed; `_store` is the `SessionStore` seam. **Two API replicas, session created via the Service, `redis-sessions dbsize=1` with the exact `to_dict()` payload present, 8/8 reads across both replicas.** |
 | **US-005** Session serializer | ✅ **Done, verified** | `Session.to_dict()`/`from_dict()`. Unknown keys tolerated (rolling deploys); unknown `state` raises rather than silently rewinding an interview. Confirmed by the same Redis payload above. |
 | **US-006** Probes + router | ✅ **Done, verified in-cluster** | `/healthz` (checks nothing), `/readyz` (per-dependency breakdown), `/health` unchanged as a legacy alias. Routes on one `APIRouter` before the static mount. **Verified by taking Redis down: `/readyz` → 503 naming `store: TimeoutError`, `/healthz` → 200, the pod left the Ready set, Service endpoints went EMPTY, and it recovered to 1/1 when Redis returned.** |
-| **US-007** Config CORS | ❌ Not started | No `cors_origins` in `config.py`; the four-entry localhost allowlist at `server.py:38-46` is unchanged. |
+| **US-007** Config CORS | ❌ Not started | No `cors_origins` in `config.py`; the four-entry localhost allowlist is unchanged, now at `server.py` (the app-assembly module) after the US-006 route extraction. |
 | **US-008** httpx pooling + metrics | ❌ Not started | **6 per-call `httpx.AsyncClient(` construction sites remain** (`llm.py` 2, `rag_client.py` 1, `stt.py` 1, `tts.py` 2). `LLMConfig.timeout=300.0` still on the voice path; MCP handshake still per retrieval. |
 | **US-009** BankStore protocol | ❌ Not started | No `interviewer/bank_store.py`. |
 | **US-010** Object-storage backend | ❌ Not started | Same. Banks still read from the pod's image-local folder; **`POST /skills` writes are still lost on any other replica.** |

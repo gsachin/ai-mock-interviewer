@@ -87,12 +87,13 @@ configMapGenerator:
       # `stt` and `tts` Deployments sit next to it, running and Ready, waiting
       # for that story.
       #
-      # That is exactly why the base URLs below are still set: when US-011
-      # flips these two values to `whisper-http` / `kokoro-http`, nothing else
-      # in this overlay changes. The engines are already there.
-      - INTERVIEW_STT_PROVIDER=faster-whisper
+      # US-011 has landed, so these are the REMOTE engines now -- exactly the
+      # flip this comment predicted, with nothing else in the overlay changed.
+      # The worker is CPU-only and I/O-bound, which is what makes its finite
+      # load_threshold accurate and dispatch across replicas possible.
+      - INTERVIEW_STT_PROVIDER=whisper-http
       - INTERVIEW_STT_BASE_URL=http://stt:8000/v1
-      - INTERVIEW_TTS_PROVIDER=kokoro
+      - INTERVIEW_TTS_PROVIDER=kokoro-http
       - INTERVIEW_TTS_BASE_URL=http://tts:8880/v1
       # ── RAG: in-process backends, no search tier ──────────────────────────
       # Chroma on a local volume instead of Qdrant, and the in-RAM BM25 index

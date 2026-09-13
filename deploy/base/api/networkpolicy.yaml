@@ -17,6 +17,26 @@ spec:
   policyTypes:
     - Ingress
   ingress:
+    # The voice worker, and ONLY for the in-cluster end-to-end smoke test.
+    #
+    # scripts/e2e_voice_client.py drives a real interview -- it needs
+    # livekit-rtc and a working TTS engine to synthesise candidate answers, and
+    # the worker image is the one pod in this namespace that carries those. It
+    # could not run from outside the cluster either, because /voice/token
+    # returns the in-cluster LIVEKIT_URL, which does not resolve on a laptop.
+    #
+    # Called out explicitly because it is a test affordance rather than a
+    # production requirement: the worker does not otherwise call the API. When
+    # US-020's CI e2e job lands, this rule should move to a dedicated test
+    # ServiceAccount so the exception is scoped to the job rather than to the
+    # worker's whole lifetime.
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: voice-worker
+      ports:
+        - port: 8010
+          protocol: TCP
     - from:
         # The ingress namespace, matched by the label the API server sets on
         # every namespace (kubernetes.io/metadata.name) so it cannot drift from

@@ -47,6 +47,27 @@ spec:
         # same reasoning as ollama and livekit.
         seccompProfile:
           type: RuntimeDefault
+      initContainers:
+        # Speaches scans its HuggingFace cache at STARTUP via
+        # huggingface_hub.scan_cache_dir(), which RAISES on a missing directory
+        # rather than creating it:
+        #   CacheNotFound: Cache directory not found:
+        #     /home/ubuntu/.cache/huggingface/hub
+        # An emptyDir mounts as an empty directory, so .../huggingface exists
+        # but hub/ does not, and the container crashloops on a startup probe
+        # 500 before it ever serves a request.
+        #
+        # Pre-creating the subdirectory is the fix rather than a bigger mount:
+        # the parent is image-owned and the emptyDir only needs to provide the
+        # writable leaf. Same family as the redis/ollama read-only-rootfs
+        # defects -- a data directory the image needs that no one mounted.
+        - name: prepare-hf-cache
+          image: ghcr.io/speaches-ai/speaches:latest-cpu
+          imagePullPolicy: IfNotPresent
+          command: ["mkdir", "-p", "/cache/hub"]
+          volumeMounts:
+            - name: hf-cache
+              mountPath: /cache
       containers:
         - name: stt
           image: ghcr.io/speaches-ai/speaches:latest-cpu

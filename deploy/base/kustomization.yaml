@@ -56,6 +56,7 @@ resources:
 
   - data/redis-sessions.yaml
   - data/redis-livekit.yaml
+  - data/redis-networkpolicy.yaml
 
   - jobs/bootstrap-banks.yaml
 

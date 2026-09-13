@@ -1,0 +1,89 @@
+# Ingress to both Redis instances.
+#
+# Second instance of one defect: base/networkpolicy.yaml sets a namespace-wide
+# default-deny, and every workload got a matching *-ingress policy EXCEPT the
+# redis pair. The API could not reach its session store and failed on the
+# first request with `redis.exceptions.TimeoutError: Timeout connecting to
+# server` -- a green deploy, healthy probes, and a 500 on the first write.
+#
+# The first instance was livekit (see base/livekit/networkpolicy.yaml). Both
+# were found only by exercising the cluster; neither is visible in a rendered
+# manifest. The general lesson, worth acting on: **every workload needs a
+# matching ingress policy, and that should be a machine check rather than a
+# review convention.** See the e2e/validation note in US-020.
+---
+# Session store. Reached by the management plane, and later by the voice
+# worker once US-012 persists interview results directly.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: redis-sessions-ingress
+  namespace: mock-interviewer
+  labels:
+    app.kubernetes.io/part-of: mock-interviewer
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: redis-sessions
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: api
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: voice-worker
+        # The RAG service's semantic cache (RAG_CORE_CACHE_BACKEND=redisvl)
+        # shares this instance. Flagged rather than assumed: if that cache is
+        # ever pointed at redis-livekit instead, this rule must move with it.
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: rag
+      ports:
+        - port: 6379
+          protocol: TCP
+    # Probes are node-sourced and are not matched by podSelector rules.
+    - from:
+        - ipBlock:
+            # RFC 5737 documentation range -- REPLACE with the node CIDR on an
+            # enforcing CNI. Same placeholder as base/networkpolicy.yaml.
+            cidr: 192.0.2.0/24
+      ports:
+        - port: 6379
+          protocol: TCP
+---
+# SFU coordination store. Deliberately NOT folded into the policy above: the
+# point of running two Redis instances (NFR-17) is that an SFU incident must
+# not take session state with it, and a shared ingress rule would blur exactly
+# that boundary. Nothing claims this instance yet -- the single-node --dev SFU
+# needs no Redis -- so this rule admits only the SFU and stays inert until
+# US-016 points the multi-node chart at it.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: redis-livekit-ingress
+  namespace: mock-interviewer
+  labels:
+    app.kubernetes.io/part-of: mock-interviewer
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: redis-livekit
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: livekit
+      ports:
+        - port: 6379
+          protocol: TCP
+    - from:
+        - ipBlock:
+            cidr: 192.0.2.0/24
+      ports:
+        - port: 6379
+          protocol: TCP

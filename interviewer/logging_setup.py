@@ -79,6 +79,40 @@ class JsonFormatter(logging.Formatter):
         return json.dumps(payload, ensure_ascii=False, default=str)
 
 
+# Third-party loggers that install their OWN handlers. Left alone they emit
+# every line twice — once through their formatter and once through ours — and
+# a log pipeline then stores two differently-shaped copies of each event.
+#
+#   uvicorn        — installs handlers that do not propagate, so configuring
+#                    only the root logger leaves the server's lines in plain
+#                    text while the app's are JSON.
+#   livekit.agents — ships its own JSON formatter with a different schema
+#                    ({message, name, timestamp} vs {msg, logger, ts}), so the
+#                    duplication is not even obvious at a glance.
+#
+# Clearing their handlers and letting them propagate gives one format on
+# stdout. Preferable to uvicorn's --log-config, which would need a JSON file
+# mounted into the image and would leave the format decision in two places.
+_LIBRARY_LOGGERS = (
+    "uvicorn", "uvicorn.error", "uvicorn.access",
+    "livekit", "livekit.agents", "livekit.agents.worker",
+)
+
+
+def normalize_library_loggers() -> None:
+    """Route third-party loggers through the root handler.
+
+    Idempotent and safe to call again: some libraries (livekit-agents) set up
+    logging when their runner starts rather than at import, which is after
+    ``configure_logging`` has already run. Re-calling this after startup
+    re-applies the normalization instead of leaving a duplicate stream.
+    """
+    for name in _LIBRARY_LOGGERS:
+        logger = logging.getLogger(name)
+        logger.handlers = []
+        logger.propagate = True
+
+
 def configure_logging(service: str = "", level: str | None = None) -> None:
     """Install the formatter on the root logger.
 
@@ -104,14 +138,4 @@ def configure_logging(service: str = "", level: str | None = None) -> None:
     for name, quiet_level in _QUIET.items():
         logging.getLogger(name).setLevel(quiet_level)
 
-    # uvicorn installs its OWN handlers on these loggers and does not
-    # propagate, so configuring only the root logger leaves the server's own
-    # lines in plain text while the app's lines are JSON — a mixed stream that
-    # a log shipper parses badly. Routing them through the root handler gives
-    # one consistent format on stdout. `--log-config` is deliberately not used
-    # instead: it would need a JSON file mounted into the image, and this keeps
-    # the format decision in one place for both entrypoints.
-    for name in ("uvicorn", "uvicorn.error", "uvicorn.access"):
-        uvicorn_logger = logging.getLogger(name)
-        uvicorn_logger.handlers = []
-        uvicorn_logger.propagate = True
+    normalize_library_loggers()

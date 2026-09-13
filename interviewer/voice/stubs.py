@@ -42,14 +42,27 @@ class StubLLM:
         self.prompts: list[list[dict]] = []
         self.metrics = type("Metrics", (), {"first_token_ms": 1.0, "total_ms": 2.0})()
 
-    async def respond_stream(self, messages: list[dict]) -> AsyncIterator[str]:
+    async def respond_stream(self, messages: list[dict], *,
+                             metrics=None) -> AsyncIterator[str]:
         self.prompts.append(messages)
         line = self._script.pop(0) if self._script else ""
         if line:
+            # Honour the metrics contract. A stub that accepts the object but
+            # never fills it would let the brain's per-hop latency accounting
+            # regress silently -- the test would pass while production
+            # reported None for every hop.
+            target = metrics if metrics is not None else self.metrics
+            target.first_token_ms = 1.0
+            target.total_ms = 2.0
             yield line
+            return
+        target = metrics if metrics is not None else self.metrics
+        target.total_ms = 2.0
 
-    async def respond(self, messages: list[dict]) -> str:
+    async def respond(self, messages: list[dict], *, metrics=None) -> str:
         self.prompts.append(messages)
+        target = metrics if metrics is not None else self.metrics
+        target.total_ms = 2.0
         if self._evaluations:
             return self._evaluations.pop(0)
         return self.DEFAULT_EVALUATION

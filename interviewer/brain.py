@@ -17,7 +17,7 @@ import time
 from dataclasses import dataclass
 from typing import Any, Awaitable, Callable, Protocol
 
-from interviewer.llm import OpenAICompatibleLLM
+from interviewer.llm import LLMMetrics, OpenAICompatibleLLM
 from interviewer.prompts import (
     MAX_SPOKEN_CHARS,
     build_evaluation_prompt,
@@ -235,7 +235,15 @@ class LLMInterviewer:
             if self._last_tts_ms == 0.0:
                 self._last_tts_ms = (time.perf_counter() - t0) * 1000
 
-        async for delta in engine.respond_stream(messages):
+        # A per-call metrics object, passed in rather than read off the engine.
+        # This is what makes a SHARED engine safe (US-011): engines are
+        # currently built per interview, so mutating engine.metrics could not
+        # collide, but once they are per-process two concurrent turns would
+        # overwrite each other's first-token latency -- the number the latency
+        # SLO is computed from. Holding this exact object also keeps per-hop
+        # attribution honest: this call cannot read a neighbour's numbers.
+        call_metrics = LLMMetrics()
+        async for delta in engine.respond_stream(messages, metrics=call_metrics):
             parts.append(delta)
             for sentence in accumulator.feed(delta):
                 if self._interrupted:
@@ -248,16 +256,20 @@ class LLMInterviewer:
             for sentence in accumulator.flush():
                 if self.tts is not None:
                     await _synth(sentence)
-        self._current_metrics = engine.metrics
+        self._current_metrics = call_metrics
         return "".join(parts).strip()[:self._spoken_max_chars]
 
     async def _judge(self, prompt: str) -> Evaluation:
         t0 = time.perf_counter()
         messages = [{"role": "system", "content": self._system_prompt},
                     {"role": "user", "content": prompt}]
-        result = parse_evaluation(await self._llm.respond(messages))
+        # Per-call metrics for the same reason as _speak: the judge engine can
+        # be shared too, and judge_wait_ms is reported per hop.
+        call_metrics = LLMMetrics()
+        result = parse_evaluation(
+            await self._llm.respond(messages, metrics=call_metrics))
         self._last_judge_ms = (time.perf_counter() - t0) * 1000
-        self._current_metrics = self._llm.metrics
+        self._current_metrics = call_metrics
         return result
 
     async def _listen(self, question_id: str) -> CandidateAnswer:

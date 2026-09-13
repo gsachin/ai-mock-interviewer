@@ -35,7 +35,7 @@ class _FakeSession:
     async def initialize(self):
         self.initialized = True
 
-    async def call_tool(self, name, args):
+    async def call_tool(self, name, args, read_timeout_seconds=None, **kw):
         self.calls.append((name, args))
         return _FakeResult(self._script[name])
 
@@ -83,9 +83,9 @@ def _patch_mcp_recording(monkeypatch, script, recorded):
     """_patch_mcp + a session that appends every (tool, args) to ``recorded``."""
 
     class _RecordingSession(_FakeSession):
-        async def call_tool(self, name, args):
+        async def call_tool(self, name, args, read_timeout_seconds=None, **kw):
             recorded.append((name, args))
-            return await super().call_tool(name, args)
+            return await super().call_tool(name, args, read_timeout_seconds=read_timeout_seconds)
 
     _patch_mcp(monkeypatch, script)
 
@@ -140,7 +140,7 @@ def test_register_bank_force_flag_and_error_mapping(monkeypatch):
         is_error = True
 
     class _ErrSession(_FakeSession):
-        async def call_tool(self, name, args):
+        async def call_tool(self, name, args, read_timeout_seconds=None, **kw):
             self.calls.append((name, args))
             return _ErrResult()
 

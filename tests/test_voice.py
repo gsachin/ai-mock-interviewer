@@ -108,7 +108,7 @@ def test_barge_in_interrupts_mid_sentence():
     tts = SlowTTS()
 
     class SlowStreamLLM(StubLLM):
-        async def respond_stream(self, messages):
+        async def respond_stream(self, messages, *, metrics=None):
             self.prompts.append(messages)
             line = self._script.pop(0) if self._script else ""
             if not line:

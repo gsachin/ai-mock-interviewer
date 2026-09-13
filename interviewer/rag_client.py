@@ -6,8 +6,9 @@ repo's own boot test uses). OIDC mode: set ``RAG_MCP_TOKEN`` (bearer,
 scope ``rag:retrieve``). none-auth mode: leave it unset and every request
 runs as the RAG service's default tenant.
 """
+import asyncio
 import json
-from contextlib import asynccontextmanager
+from contextlib import AsyncExitStack, asynccontextmanager
 from typing import Any, AsyncIterator
 
 import httpx
@@ -81,9 +82,18 @@ class RagClient:
                  token: str | None = None):
         self._url = url
         self._token = token
+        # Persistent-session state. All four are cleared together by aclose()
+        # so a half-torn-down client is never observable.
+        self._stack: AsyncExitStack | None = None
+        self._http: httpx.AsyncClient | None = None
+        self._session: ClientSession | None = None
+        self._loop: asyncio.AbstractEventLoop | None = None
+        self._lock = asyncio.Lock()
 
     @asynccontextmanager
     async def session(self, timeout_s: float = 30.0) -> AsyncIterator[ClientSession]:
+        """A one-shot session. Kept for callers that genuinely want isolation;
+        normal traffic goes through the persistent session below."""
         headers = {"Authorization": f"Bearer {self._token}"} if self._token else {}
         async with httpx.AsyncClient(headers=headers, timeout=timeout_s) as hc:
             async with streamable_http_client(self._url, http_client=hc) as (read, write):
@@ -91,15 +101,87 @@ class RagClient:
                     await session.initialize()
                     yield session
 
+    async def _ensure_session(self, timeout_s: float) -> ClientSession:
+        """One long-lived MCP session per client, built on first use.
+
+        The previous behaviour opened a fresh session per call, which meant
+        every single retrieval paid a full JSON-RPC ``initialize()``
+        handshake on top of a new TCP connection. RAG measures 200-360 ms
+        against a 150 ms stage budget, so that handshake was a large slice of
+        an already-over-budget hop -- and it is the one latency fix in this
+        migration that needs no GPU at all.
+
+        Loop-aware on purpose: the session is bound to the event loop that
+        created it, so a cached session reused from a different loop (which is
+        exactly what a test doing one ``asyncio.run`` per case does) is
+        detected and replaced rather than silently failing later.
+        """
+        loop = asyncio.get_running_loop()
+        if self._session is not None and self._loop is loop:
+            return self._session
+        if self._session is not None:
+            # Bound to a loop that no longer exists -- drop it and rebuild.
+            await self.aclose()
+
+        async with self._lock:
+            if self._session is not None and self._loop is loop:
+                return self._session
+            headers = ({"Authorization": f"Bearer {self._token}"}
+                       if self._token else {})
+            stack = AsyncExitStack()
+            http = await stack.enter_async_context(
+                httpx.AsyncClient(headers=headers, timeout=timeout_s,
+                                  limits=httpx.Limits(max_connections=8,
+                                                      max_keepalive_connections=4)))
+            read, write = await stack.enter_async_context(
+                streamable_http_client(self._url, http_client=http))
+            session = await stack.enter_async_context(ClientSession(read, write))
+            await session.initialize()
+            self._stack, self._http, self._session, self._loop = (
+                stack, http, session, loop)
+            return session
+
+    async def aclose(self) -> None:
+        """Tear the persistent session down. Safe to call repeatedly."""
+        stack, self._stack = self._stack, None
+        self._http = None
+        self._session = None
+        self._loop = None
+        if stack is not None:
+            try:
+                await stack.aclose()
+            except Exception:
+                # Closing a session whose transport already died must not
+                # raise: this runs from shutdown paths, where a secondary
+                # error would mask the real reason for terminating.
+                pass
+
     async def _call(self, tool: str, args: dict[str, Any], *,
-                    timeout_s: float = 30.0) -> str:
-        async with self.session(timeout_s=timeout_s) as session:
-            result = await session.call_tool(tool, args)
-            if result.is_error:
-                raise RuntimeError(f"MCP tool {tool} failed: {result.content}")
-            if not result.content:
-                return ""
-            return result.content[0].text
+                    timeout_s: float = 30.0, _retry: bool = True) -> str:
+        try:
+            session = await self._ensure_session(timeout_s)
+            # Per-call read timeout, so the persistent session does not force
+            # one timeout on every tool: register_bank legitimately needs 120 s
+            # for server-side embedding while the rest want 30 s.
+            # The SDK takes SECONDS AS A FLOAT, not a timedelta -- caught by
+            # checking the real signature after a test double rejected the
+            # kwarg, which would otherwise have looked like a test problem.
+            result = await session.call_tool(
+                tool, args, read_timeout_seconds=float(timeout_s))
+        except Exception:
+            # A dropped session is recoverable and every tool here is
+            # idempotent, so reconnect exactly once before surfacing the error.
+            await self.aclose()
+            if not _retry:
+                raise
+            return await self._call(tool, args, timeout_s=timeout_s,
+                                    _retry=False)
+
+        if result.is_error:
+            raise RuntimeError(f"MCP tool {tool} failed: {result.content}")
+        if not result.content:
+            return ""
+        return result.content[0].text
 
     async def retrieve_context(self, query: str, top_k: int | None = None) -> RetrieveContextResult:
         """Tenant-scoped hybrid retrieval from the RAG service. Budget: the
